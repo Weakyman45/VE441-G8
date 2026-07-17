@@ -4,9 +4,24 @@ VoiceShop++ is a real-time multimodal shopping copilot. It helps shoppers state 
 
 ## Getting Started
 
-This repository is currently at the documentation and architecture-design stage. Build and run commands will be added when the Android client and backend service are committed.
+This repository includes a runnable Android frontend prototype in `app/`. The current client uses a local laptop catalog so the complete shopping experience can be evaluated without API keys or a backend service.
 
-Planned direct dependencies:
+Requirements:
+
+- Android Studio with Android SDK 35
+- JDK 17 or newer (Android Studio's bundled JDK is sufficient)
+
+To run the app, open the repository in Android Studio, allow Gradle to sync, select an Android 13+ emulator or device, and run the `app` configuration.
+
+To build from the command line:
+
+```bash
+./gradlew app:assembleDebug
+```
+
+The debug APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
+
+Current and planned direct dependencies:
 
 Frontend:
 
@@ -270,6 +285,15 @@ def generate_recommendation_bundle(
 | [OkHttp WebSocket](https://square.github.io/okhttp/5.x/okhttp/okhttp3/-web-socket/) | Android client | Maintain the realtime session connection and send binary audio frames. |
 
 ## View UI/UX
+
+The Android prototype uses a discoverable four-destination structure rather than a numbered tutorial flow:
+
+- **Search** supports text, Android voice recognition, a design-reference image, and a reusable design-student preset.
+- **Matches** provides personalized ranking, working sort/filter controls, product details, review sentiment, and a two-item compare list.
+- **Compare** presents exactly two laptops as vertically stacked mobile cards with price, display, performance, reviews, weaknesses, and direct choose/detail actions.
+- **Choice** explains the selected recommendation, preserves the active shopping context, and supports confirmation or further refinement.
+
+Shopping requirements remain editable throughout the experience. Search progress is visible and interruptible, while empty Matches, Compare, and Choice states remain freely accessible so first-time users can explore the app without external instructions.
 
 ## Team Roster
 
