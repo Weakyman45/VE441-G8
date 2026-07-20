@@ -1,10 +1,5 @@
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-    }
-    dependencies {
-        classpath("com.android.tools.build:gradle:9.2.1")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.10")
-    }
+// Plugin versions are declared in settings.gradle.kts (AGP 8.10.0 for older Android Studio).
+plugins {
+    id("com.android.application") apply false
+    id("org.jetbrains.kotlin.android") apply false
 }
