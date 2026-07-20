@@ -1,9 +1,12 @@
 package cn.edu.sjtu.voiceshop
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -12,15 +15,19 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.speech.RecognizerIntent
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
+import android.util.Base64
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -37,8 +44,14 @@ import android.widget.ScrollView
 import android.widget.Space
 import android.widget.TextView
 import android.widget.Toast
+import java.io.ByteArrayOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.Executors
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : Activity() {
     private enum class Stage {
@@ -91,7 +104,7 @@ class MainActivity : Activity() {
     private val red = Color.rgb(166, 57, 57)
     private val paleRed = Color.rgb(254, 239, 239)
 
-    private val laptops = listOf(
+    private val fallbackLaptops = listOf(
         Laptop(
             "nova", "NovaBook Studio 14", 6899, 96, 4.8, "2,840 reviews",
             "14.5-inch 2.8K OLED, 100% DCI-P3",
@@ -150,11 +163,111 @@ class MainActivity : Activity() {
         )
     )
 
+    // Loaded from assets/laptops.db (Amazon Reviews 2023 subset) when present;
+    // otherwise falls back to the built-in curated catalog above.
+    private val catalogColors = listOf(
+        Color.rgb(242, 197, 76), Color.rgb(116, 155, 191), Color.rgb(126, 174, 142),
+        Color.rgb(176, 132, 190), Color.rgb(208, 134, 112), Color.rgb(94, 160, 173)
+    )
+    // Route B: the catalog is fetched over HTTP from the backend
+    // (backend/server.py, Amazon Reviews 2023 data). We start with the
+    // built-in demo list so the UI is never empty, then replace it once the
+    // network response arrives. If the backend is unreachable we keep the demo.
+    @Volatile private var laptops: List<Laptop> = fallbackLaptops
+    private var catalogSource: String = "Built-in demo (${fallbackLaptops.size}) - loading…"
+    private val catalogExecutor = Executors.newSingleThreadExecutor()
+
+    private fun loadCatalogAsync(query: String) {
+        catalogExecutor.execute {
+            val loaded = runCatching { fetchCatalog(query) }.getOrElse { error ->
+                Log.e("VoiceShop", "Catalog fetch failed for '$query'", error)
+                emptyList()
+            }
+            handler.post {
+                if (isDestroyed) return@post
+                if (loaded.isNotEmpty()) {
+                    laptops = loaded
+                    catalogSource = "Backend: ${loaded.size} laptops (q=\"$query\")"
+                    Log.i("VoiceShop", catalogSource)
+                } else {
+                    catalogSource = "Built-in demo (${fallbackLaptops.size}) - backend unreachable at $BACKEND_BASE_URL"
+                    Log.w("VoiceShop", catalogSource)
+                }
+                toast(catalogSource)
+                render()
+            }
+        }
+    }
+
+    private fun fetchCatalog(query: String): List<Laptop> {
+        val q = URLEncoder.encode(query.ifBlank { "laptop" }, "UTF-8")
+        val url = URL("$BACKEND_BASE_URL/api/v1/search?q=$q&limit=60")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 4000
+            readTimeout = 6000
+        }
+        try {
+            if (conn.responseCode != HttpURLConnection.HTTP_OK) return emptyList()
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val results = JSONObject(body).optJSONArray("results") ?: return emptyList()
+            val list = ArrayList<Laptop>(results.length())
+            for (i in 0 until results.length()) {
+                results.optJSONObject(i)?.let { list.add(jsonToLaptop(it, i)) }
+            }
+            return list
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun jsonToLaptop(obj: JSONObject, index: Int): Laptop {
+        val rating = obj.optDouble("rating", 0.0)
+        val ratingNumber = obj.optInt("rating_number", 0)
+        val store = obj.optString("store").substringBefore(" ").trim()
+        val reviewCount = if (ratingNumber > 0) "%,d reviews".format(Locale.US, ratingNumber) else "No reviews yet"
+        return Laptop(
+            id = obj.optString("id").ifBlank { "item$index" },
+            name = obj.optString("name").ifBlank { "Unnamed laptop" },
+            price = obj.optInt("price", 0),
+            match = (rating / 5.0 * 100).toInt().coerceIn(60, 99),
+            rating = rating,
+            reviewCount = reviewCount,
+            display = obj.optString("display").orEmptyText(),
+            performance = obj.optString("performance").orEmptyText(),
+            battery = obj.optString("battery").orEmptyText(),
+            weightKg = obj.optDouble("weight_kg", 0.0),
+            summary = obj.optString("summary").ifNullOrBlank { "Laptop option${if (store.isNotBlank()) " from $store" else ""}" },
+            reviewSentiment = obj.optString("review_sentiment").ifNullOrBlank { "No aggregated review summary available." },
+            weakness = obj.optString("weakness").ifNullOrBlank { "No notable weaknesses in the catalog data." },
+            reasons = jsonArrayToList(obj.optJSONArray("reasons")).ifEmpty { listOf("Matches your laptop search") },
+            tradeOffs = jsonArrayToList(obj.optJSONArray("trade_offs")).ifEmpty { listOf("Limited spec detail available for this item.") },
+            color = catalogColors[index % catalogColors.size],
+            platform = obj.optString("platform").ifNullOrBlank { "Windows" }
+        )
+    }
+
+    private fun jsonArrayToList(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+        val out = ArrayList<String>(array.length())
+        for (i in 0 until array.length()) {
+            array.optString(i).takeIf { it.isNotBlank() }?.let { out.add(it.trim()) }
+        }
+        return out
+    }
+
+    private fun String?.orEmptyText(): String = if (this.isNullOrBlank()) "Not specified" else this
+
+    private inline fun String?.ifNullOrBlank(fallback: () -> String): String =
+        if (this.isNullOrBlank()) fallback() else this
+
     private var stage = Stage.EXPRESS
     private var shoppingNeed = ""
     private var selectedImageUri: String? = null
     private var selectedImageName: String? = null
     private var imageStyleSignal: String? = null
+    private var uploadedImageId: String? = null
+    private var imageUploadInFlight = false
     private var voiceTarget = VoiceTarget.NEED
     private val mustHaves = mutableListOf("Budget up to ¥7,000", "Design-studio use", "Strong display", "16GB RAM preferred")
     private val preferences = mutableListOf("Portable for campus", "Long battery life", "Silver or neutral style")
@@ -197,12 +310,47 @@ class MainActivity : Activity() {
         }
     }
 
+    // Talker (Realtime) + Worker recommendations
+    private var realtime: RealtimeSession? = null
+    private var audioCapture: AudioCapture? = null
+    private var audioPlayer: AudioPlayer? = null
+    private var gptConnected = false
+    private var gptConnecting = false
+    private var gptListening = false
+    private var gptSpeaking = false
+    private var engineSessionId: String? = null
+    private var lastWorkerPlanId: String? = null
+    private val chatLines = mutableListOf<String>()
+    private var streamingAssistant = ""
+    private var streamingUserPartial = ""
+    private var previousAudioMode = AudioManager.MODE_NORMAL
+    @Volatile private var lastLocalBargeInAt = 0L
+    private val streamingRenderTick = Runnable {
+        if (stage == Stage.EXPRESS) render()
+    }
+    private val recommendationPollTick = object : Runnable {
+        override fun run() {
+            val sid = engineSessionId
+            if (sid.isNullOrBlank()) return
+            catalogExecutor.execute {
+                val bundle = runCatching { fetchWorkerRecommendations(sid) }.getOrNull()
+                handler.post {
+                    if (isDestroyed || engineSessionId.isNullOrBlank()) return@post
+                    if (bundle != null) applyWorkerBundle(bundle)
+                    handler.postDelayed(this, 2500L)
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         restoreState(savedInstanceState)
         window.statusBarColor = Color.WHITE
         window.navigationBarColor = Color.WHITE
+        Log.i("VoiceShop", "Catalog init: $catalogSource")
         render()
+        loadCatalogAsync(if (shoppingNeed.isBlank()) "laptop" else shoppingNeed)
         selectedImageUri?.takeIf { imageStyleSignal == null }?.let { analyzeImageStyleAsync(Uri.parse(it)) }
         window.insetsController?.setSystemBarsAppearance(
             WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,
@@ -216,6 +364,7 @@ class MainActivity : Activity() {
         outState.putString("imageUri", selectedImageUri)
         outState.putString("imageName", selectedImageName)
         outState.putString("imageStyleSignal", imageStyleSignal)
+        outState.putString("uploadedImageId", uploadedImageId)
         outState.putStringArrayList("must", ArrayList(mustHaves))
         outState.putStringArrayList("prefs", ArrayList(preferences))
         outState.putString("osPreference", osPreference)
@@ -243,6 +392,7 @@ class MainActivity : Activity() {
         selectedImageUri = state.getString("imageUri")
         selectedImageName = state.getString("imageName")
         imageStyleSignal = state.getString("imageStyleSignal")
+        uploadedImageId = state.getString("uploadedImageId")
         state.getStringArrayList("must")?.let { mustHaves.apply { clear(); addAll(it) } }
         state.getStringArrayList("prefs")?.let { preferences.apply { clear(); addAll(it) } }
         osPreference = state.getString("osPreference", "No preference")
@@ -286,7 +436,17 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        leaveDuplexAudioMode()
+        stopGptVoiceCapture()
+        audioPlayer?.release()
+        audioPlayer = null
+        realtime?.disconnect()
+        realtime = null
+        gptConnected = false
+        gptConnecting = false
+        gptSpeaking = false
         imageExecutor.shutdownNow()
+        catalogExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -342,11 +502,13 @@ class MainActivity : Activity() {
             }, fullWidth())
         }, fullWidth(bottom = dp(14)))
 
+        addView(gptRealtimeCard(), fullWidth(bottom = dp(14)))
+
         val actions = LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(entryCard(
-                if (selectedImageUri == null) "+ Add reference" else "Change reference",
-                "Match the look of a reference image"
+                if (selectedImageUri == null) "+ Add Reference" else "Change Reference",
+                "Add product photo or screenshot"
             ) { launchImagePicker() }, LinearLayout.LayoutParams(0, dp(94), 1f).withMargins(right = dp(8)))
             addView(entryCard("Design student preset", "¥7,000 • color-accurate display • portable") {
                 shoppingNeed = SAMPLE_NEED
@@ -374,9 +536,82 @@ class MainActivity : Activity() {
                 imeOptions = EditorInfo.IME_ACTION_DONE
             }
             addView(input, fullWidth(bottom = dp(12)))
-            addView(button("Review my needs", primary = true) { submitNeed() })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                if (gptConnected) {
+                    addView(button("Ask GPT", primary = true) { sendNeedToGpt() }, LinearLayout.LayoutParams(0, dp(46), 1f).withMargins(right = dp(8)))
+                    addView(button("Review my needs") { submitNeed() }, LinearLayout.LayoutParams(0, dp(46), 1f))
+                } else {
+                    addView(button("Review my needs", primary = true) { submitNeed() }, fullWidth())
+                }
+            })
         })
     }
+
+    private fun gptRealtimeCard(): View = card(paleBlue, Color.rgb(171, 210, 229)).apply {
+        val inCall = gptConnected || gptConnecting || gptListening
+        addView(text("Voice assistant", 15f, ink, Typeface.BOLD), fullWidth(bottom = dp(6)))
+        addView(text(
+            when {
+                gptConnecting -> "Starting call…"
+                gptConnected && gptSpeaking -> "In call — speak anytime to interrupt"
+                gptConnected -> "In call — listening"
+                else -> "Talk with the shopping assistant about your laptop needs."
+            },
+            12f,
+            muted
+        ), fullWidth(bottom = dp(12)))
+        addView(
+            button(
+                when {
+                    gptConnecting -> "Starting…"
+                    inCall -> "End call"
+                    else -> "Start calling"
+                },
+                primary = true,
+                enabled = !gptConnecting
+            ) {
+                if (inCall && !gptConnecting) {
+                    disconnectGpt()
+                } else if (!gptConnecting) {
+                    startCalling()
+                }
+            },
+            fullWidth(bottom = dp(10))
+        )
+
+        val logText = buildString {
+            if (chatLines.isEmpty() && streamingAssistant.isEmpty() && streamingUserPartial.isEmpty()) {
+                append("Tap Start calling, then speak. Transcript appears here.")
+            } else {
+                chatLines.takeLast(12).forEach { append(it).append('\n') }
+                if (streamingUserPartial.isNotBlank()) append("You: ").append(streamingUserPartial).append('\n')
+                if (streamingAssistant.isNotBlank()) append("GPT: ").append(streamingAssistant)
+            }
+        }.trimEnd()
+        addView(text(logText, 12f, ink).apply {
+            background = rect(Color.WHITE, border, 1, 8)
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            minHeight = dp(96)
+        }, fullWidth())
+        if (chatLines.isNotEmpty() || streamingAssistant.isNotBlank()) {
+            addView(button("Clear chat") {
+                chatLines.clear()
+                streamingAssistant = ""
+                streamingUserPartial = ""
+                render()
+            }, fullWidth(top = dp(8)))
+        }
+    }
+
+    /** One-tap: connect Realtime + open the mic for a live call. */
+    private fun startCalling() {
+        if (gptConnecting || gptConnected) return
+        ensureMicPermissionThen {
+            connectGpt()
+        }
+    }
+
 
     private fun imageAttachmentCard(): View = card(paleBlue, Color.rgb(171, 210, 229)).apply {
         orientation = LinearLayout.HORIZONTAL
@@ -393,7 +628,12 @@ class MainActivity : Activity() {
             addView(text("Reference added", 14f, ink, Typeface.BOLD), fullWidth(bottom = dp(4)))
             addView(text(selectedImageName ?: "Design reference image", 12f, muted), fullWidth(bottom = dp(8)))
             addView(text(
-                imageStyleSignal?.let { "Visual preference • $it" } ?: "Reading colors…",
+                when {
+                    imageUploadInFlight -> "Uploading to vision worker..."
+                    uploadedImageId != null && imageStyleSignal != null -> "LLM visual read: $imageStyleSignal"
+                    imageStyleSignal != null -> "Local visual read: $imageStyleSignal"
+                    else -> "Reading image..."
+                },
                 12f,
                 blue,
                 Typeface.BOLD
@@ -402,6 +642,8 @@ class MainActivity : Activity() {
                 selectedImageUri = null
                 selectedImageName = null
                 imageStyleSignal = null
+                uploadedImageId = null
+                imageUploadInFlight = false
                 contextSignalChanged()
                 render()
             })
@@ -417,7 +659,7 @@ class MainActivity : Activity() {
             selectedImageName?.let {
                 addView(text("Image: $it", 12f, muted), fullWidth(bottom = dp(4)))
                 addView(text(
-                    imageStyleSignal?.let { signal -> "Visual preference • $signal" } ?: "Reading colors…",
+                    imageStyleSignal?.let { signal -> "Visual preference - $signal" } ?: "Reading image...",
                     12f,
                     blue,
                     Typeface.BOLD
@@ -436,9 +678,9 @@ class MainActivity : Activity() {
             }, LinearLayout.LayoutParams(0, dp(48), 1f).withMargins(right = dp(8)))
             addView(button(if (selectedImageUri == null) "Add reference" else "Change reference") { launchImagePicker() }, LinearLayout.LayoutParams(0, dp(48), 1f))
         }, fullWidth(bottom = dp(14)))
-        val imageReady = selectedImageUri == null || imageStyleSignal != null
+        val imageReady = selectedImageUri == null || (!imageUploadInFlight && imageStyleSignal != null)
         addView(button(
-            if (imageReady) "Find matching laptops" else "Reading reference…",
+            if (imageReady) "Find matching laptops" else "Reading reference...",
             primary = true,
             enabled = imageReady
         ) {
@@ -1071,7 +1313,496 @@ class MainActivity : Activity() {
         shoppingNeed = shoppingNeed.trim()
         invalidateResults()
         deriveAssumptionsFromNeed()
+        loadCatalogAsync(shoppingNeed)
+        submitNeedToBackendAsync(shoppingNeed)
         setStage(Stage.CONTEXT)
+    }
+
+    private fun sendNeedToGpt() {
+        val text = shoppingNeed.trim()
+        if (text.length < 2) {
+            toast("Type a message first")
+            return
+        }
+        if (!gptConnected) {
+            toast("Start calling first")
+            return
+        }
+        val played = audioPlayer?.playedMs() ?: 0
+        audioPlayer?.interrupt()
+        gptSpeaking = false
+        realtime?.interruptAssistant(played)
+        appendChat("You: $text")
+        streamingAssistant = ""
+        realtime?.sendText(text)
+        render()
+    }
+
+    private fun connectGpt() {
+        if (gptConnecting || gptConnected) return
+        gptConnecting = true
+        streamingAssistant = ""
+        streamingUserPartial = ""
+        gptSpeaking = false
+        lastWorkerPlanId = null
+        if (audioPlayer == null) audioPlayer = AudioPlayer()
+        render()
+        val session = RealtimeSession(
+            BACKEND_BASE_URL,
+            initialSessionId = engineSessionId,
+            listener = object : RealtimeSession.Listener {
+            override fun onConnectionChanged(connected: Boolean) {
+                handler.post {
+                    gptConnected = connected
+                    gptConnecting = false
+                    if (!connected) {
+                        stopRecommendationPolling()
+                        stopGptVoiceCapture()
+                        audioPlayer?.interrupt()
+                        leaveDuplexAudioMode()
+                        gptSpeaking = false
+                        engineSessionId = null
+                    } else {
+                        ensureMicPermissionThen { startGptVoiceCapture() }
+                        startRecommendationPolling()
+                    }
+                    if (stage == Stage.EXPRESS) render() else toast(if (connected) "Call connected" else "Call ended")
+                }
+            }
+
+            override fun onSessionReady(sessionId: String) {
+                handler.post {
+                    engineSessionId = sessionId
+                    Log.i("VoiceShop", "Engine session $sessionId")
+                }
+            }
+
+            override fun onUserSpeechStarted() {
+                handler.post {
+                    // Barge-in: stop local playback and truncate unplayed assistant audio.
+                    val played = audioPlayer?.playedMs() ?: 0
+                    audioPlayer?.interrupt()
+                    gptSpeaking = false
+                    streamingAssistant = ""
+                    realtime?.interruptAssistant(played)
+                    scheduleExpressRender(immediate = true)
+                }
+            }
+
+            override fun onUserSpeechStopped() {
+                handler.post { scheduleExpressRender() }
+            }
+
+            override fun onUserTranscript(text: String, isFinal: Boolean) {
+                handler.post {
+                    if (isFinal) {
+                        streamingUserPartial = ""
+                        if (text.isNotBlank()) {
+                            appendChat("You: $text")
+                            if (shoppingNeed.isBlank() || gptListening) {
+                                shoppingNeed = text
+                            }
+                        }
+                        scheduleExpressRender(immediate = true)
+                    } else {
+                        streamingUserPartial = text
+                        scheduleExpressRender()
+                    }
+                }
+            }
+
+            override fun onAssistantTextDelta(delta: String) {
+                handler.post {
+                    streamingAssistant += delta
+                    scheduleExpressRender()
+                }
+            }
+
+            override fun onAssistantTextDone(full: String) {
+                handler.post {
+                    val message = full.trim()
+                    streamingAssistant = ""
+                    if (message.isNotBlank()) appendChat("GPT: $message")
+                    scheduleExpressRender(immediate = true)
+                }
+            }
+
+            override fun onAssistantAudio(pcm16: ByteArray) {
+                gptSpeaking = true
+                audioPlayer?.playPcm16(pcm16)
+            }
+
+            override fun onAssistantItemStarted(itemId: String) {
+                audioPlayer?.startItem(itemId)
+                gptSpeaking = true
+            }
+
+            override fun onStatus(message: String) {
+                handler.post { Log.i("VoiceShop", "Realtime: $message") }
+            }
+
+            override fun onError(message: String) {
+                handler.post {
+                    gptConnecting = false
+                    toast(message)
+                    if (stage == Stage.EXPRESS) render()
+                }
+            }
+            }
+        )
+        realtime = session
+        session.connect()
+    }
+
+    private fun disconnectGpt() {
+        stopRecommendationPolling()
+        stopGptVoiceCapture()
+        audioPlayer?.interrupt()
+        leaveDuplexAudioMode()
+        realtime?.disconnect()
+        realtime = null
+        gptConnected = false
+        gptConnecting = false
+        gptSpeaking = false
+        engineSessionId = null
+        streamingAssistant = ""
+        streamingUserPartial = ""
+        render()
+    }
+
+    private fun startRecommendationPolling() {
+        handler.removeCallbacks(recommendationPollTick)
+        handler.postDelayed(recommendationPollTick, 1500L)
+    }
+
+    private fun stopRecommendationPolling() {
+        handler.removeCallbacks(recommendationPollTick)
+    }
+
+    private fun ensureBackendSession(): String {
+        engineSessionId?.takeIf { it.isNotBlank() }?.let { return it }
+        val url = URL("$BACKEND_BASE_URL/api/v1/session")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 5000
+            readTimeout = 8000
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        try {
+            conn.outputStream.use { it.write("{}".toByteArray(Charsets.UTF_8)) }
+            val body = (if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()
+                ?.use { it.readText() }
+                .orEmpty()
+            if (conn.responseCode !in 200..299) {
+                throw IllegalStateException("Session create failed: HTTP ${conn.responseCode} $body")
+            }
+            val sid = JSONObject(body).optString("session_id")
+            if (sid.isBlank()) throw IllegalStateException("Backend did not return session_id")
+            engineSessionId = sid
+            return sid
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun uploadSelectedImageAsync(uri: Uri) {
+        val uriString = uri.toString()
+        imageUploadInFlight = true
+        uploadedImageId = null
+        render()
+        imageExecutor.execute {
+            val result = runCatching {
+                val sid = ensureBackendSession()
+                val jpeg = encodeImageForUpload(uri)
+                val payload = JSONObject().apply {
+                    put("session_id", sid)
+                    put("filename", selectedImageName ?: displayName(uri))
+                    put("mime_type", "image/jpeg")
+                    put("user_text", shoppingNeed)
+                    put("image_base64", Base64.encodeToString(jpeg, Base64.NO_WRAP))
+                }
+                postImagePayload(payload)
+            }
+            handler.post {
+                if (isDestroyed || selectedImageUri != uriString) return@post
+                imageUploadInFlight = false
+                result
+                    .onSuccess { response ->
+                        uploadedImageId = response.optString("image_id").takeIf { it.isNotBlank() }
+                        val visual = response.optString("visual_context")
+                        if (visual.isNotBlank()) {
+                            imageStyleSignal = visual
+                            if (preferences.none { it.contains("image reference", ignoreCase = true) }) {
+                                preferences.add("Image reference: ${visual.take(90)}")
+                            }
+                        }
+                        toast("Image analyzed")
+                        render()
+                    }
+                    .onFailure { error ->
+                        Log.e("VoiceShop", "Image upload failed", error)
+                        if (imageStyleSignal == null) imageStyleSignal = analyzeImageStyle(uri) ?: "Visual reference"
+                        toast("Image upload failed: ${error.message}")
+                        render()
+                    }
+            }
+        }
+    }
+
+    private fun submitNeedToBackendAsync(text: String) {
+        catalogExecutor.execute {
+            val result = runCatching {
+                val sid = ensureBackendSession()
+                val payload = JSONObject().apply { put("text", text) }
+                postSessionText(sid, payload)
+            }
+            handler.post {
+                result
+                    .onSuccess { response ->
+                        response.optString("visual_context")
+                            .takeIf { it.isNotBlank() && selectedImageUri != null }
+                            ?.let { imageStyleSignal = it }
+                        startRecommendationPolling()
+                        Log.i("VoiceShop", "Need submitted to engine session ${engineSessionId.orEmpty()}")
+                    }
+                    .onFailure { error ->
+                        Log.e("VoiceShop", "Need submit failed", error)
+                        toast("Backend need update failed: ${error.message}")
+                    }
+            }
+        }
+    }
+
+    private fun postSessionText(sessionId: String, payload: JSONObject): JSONObject {
+        val url = URL("$BACKEND_BASE_URL/api/v1/session/$sessionId/text")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 6000
+            readTimeout = 15_000
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        try {
+            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+            val body = (if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()
+                ?.use { it.readText() }
+                .orEmpty()
+            if (conn.responseCode !in 200..299) {
+                throw IllegalStateException("Need submit HTTP ${conn.responseCode}: $body")
+            }
+            return JSONObject(body)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun postImagePayload(payload: JSONObject): JSONObject {
+        val url = URL("$BACKEND_BASE_URL/api/v1/image")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 8000
+            readTimeout = 60_000
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        try {
+            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+            val body = (if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()
+                ?.use { it.readText() }
+                .orEmpty()
+            if (conn.responseCode !in 200..299) {
+                throw IllegalStateException("Image upload HTTP ${conn.responseCode}: $body")
+            }
+            return JSONObject(body)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun encodeImageForUpload(uri: Uri): ByteArray {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            throw IllegalArgumentException("Could not read image size")
+        }
+        var sampleSize = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sampleSize > IMAGE_UPLOAD_MAX_SIDE) {
+            sampleSize *= 2
+        }
+        val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        val bitmap = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+            ?: throw IllegalArgumentException("Could not decode image")
+        return try {
+            ByteArrayOutputStream().use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, IMAGE_UPLOAD_JPEG_QUALITY, out)
+                out.toByteArray()
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun fetchWorkerRecommendations(sessionId: String): JSONObject? {
+        val url = URL("$BACKEND_BASE_URL/api/v1/session/$sessionId/recommendations")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 4000
+            readTimeout = 6000
+        }
+        try {
+            if (conn.responseCode != HttpURLConnection.HTTP_OK) return null
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val obj = JSONObject(body)
+            val bundle = obj.optJSONObject("bundle") ?: return null
+            val rankedLen = bundle.optJSONArray("ranked")?.length() ?: 0
+            if (rankedLen <= 0) return null
+            return bundle
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun applyWorkerBundle(bundle: JSONObject) {
+        val planId = bundle.optString("plan_id")
+        if (planId.isNotBlank() && planId == lastWorkerPlanId) return
+        val ranked = bundle.optJSONArray("ranked") ?: return
+        if (ranked.length() == 0) return
+        val mapped = ArrayList<Laptop>(ranked.length())
+        for (i in 0 until ranked.length()) {
+            val item = ranked.optJSONObject(i) ?: continue
+            mapped.add(
+                Laptop(
+                    id = item.optString("id").ifBlank { "w$i" },
+                    name = item.optString("name").ifBlank { "Laptop" },
+                    price = item.optInt("price", 0),
+                    match = item.optInt("score", 80).coerceIn(60, 99),
+                    rating = item.optDouble("rating", 0.0),
+                    reviewCount = "Worker match",
+                    display = item.optString("display").ifBlank { "Not specified" },
+                    performance = item.optString("performance").ifBlank { "Not specified" },
+                    battery = "Not specified",
+                    weightKg = item.optDouble("weight_kg", 0.0),
+                    summary = item.optString("summary").ifBlank {
+                        item.optJSONArray("reasons")?.optString(0) ?: "Worker recommendation"
+                    },
+                    reviewSentiment = "Ranked by Worker runtime",
+                    weakness = "See trade-offs in details",
+                    reasons = jsonArrayToList(item.optJSONArray("reasons")).ifEmpty { listOf("Worker match") },
+                    tradeOffs = listOf("Confirm specs before purchase"),
+                    color = catalogColors[i % catalogColors.size],
+                    platform = item.optString("platform").ifBlank { "Windows" }
+                )
+            )
+        }
+        if (mapped.isEmpty()) return
+        lastWorkerPlanId = planId
+        laptops = mapped
+        catalogSource = "Worker: ${mapped.size} ranked (plan=$planId)"
+        val summary = bundle.optString("summary")
+        if (summary.isNotBlank()) toast(summary)
+        Log.i("VoiceShop", catalogSource)
+        if (stage == Stage.RECOMMEND || stage == Stage.EXPRESS) render()
+    }
+
+    private fun ensureMicPermissionThen(action: () -> Unit) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            action()
+        } else {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_MIC)
+        }
+    }
+
+    private fun startGptVoiceCapture() {
+        if (audioCapture?.isRunning() == true) return
+        try {
+            enterDuplexAudioMode()
+            if (audioPlayer == null) audioPlayer = AudioPlayer()
+            val capture = AudioCapture(
+                onPcmChunk = { pcm -> realtime?.appendAudioPcm16(pcm) },
+                onEnergy = { rms -> maybeLocalBargeIn(rms) }
+            )
+            capture.start()
+            audioCapture = capture
+            gptListening = true
+            toast("Live duplex on — speak anytime to interrupt")
+            render()
+        } catch (error: Exception) {
+            gptListening = false
+            audioCapture = null
+            leaveDuplexAudioMode()
+            toast("Mic failed: ${error.message}")
+            render()
+        }
+    }
+
+    /**
+     * Emulator barge-in: server VAD often misses the user while speakerphone is blasting.
+     * If mic energy spikes while we are playing assistant audio, stop locally immediately.
+     */
+    private fun maybeLocalBargeIn(rms: Double) {
+        if (!gptSpeaking && audioPlayer?.isPlaying() != true) return
+        if (rms < LOCAL_BARGE_IN_RMS) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastLocalBargeInAt < 700L) return
+        lastLocalBargeInAt = now
+        handler.post {
+            if (!gptConnected) return@post
+            Log.i("VoiceShop", "Local barge-in rms=${rms.toInt()}")
+            val played = audioPlayer?.playedMs() ?: 0
+            audioPlayer?.interrupt()
+            gptSpeaking = false
+            streamingAssistant = ""
+            realtime?.interruptAssistant(played)
+            scheduleExpressRender(immediate = true)
+        }
+    }
+
+    private fun stopGptVoiceCapture() {
+        audioCapture?.stop()
+        audioCapture = null
+        gptListening = false
+    }
+
+    private fun enterDuplexAudioMode() {
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        previousAudioMode = am.mode
+        // MODE_NORMAL + MEDIA playback avoids strong AEC that mutes the mic during TTS.
+        am.mode = AudioManager.MODE_NORMAL
+        @Suppress("DEPRECATION")
+        am.isSpeakerphoneOn = true
+    }
+
+    private fun leaveDuplexAudioMode() {
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        @Suppress("DEPRECATION")
+        am.isSpeakerphoneOn = false
+        am.mode = previousAudioMode
+    }
+
+    private fun appendChat(line: String) {
+        chatLines.add(line)
+        while (chatLines.size > 40) chatLines.removeAt(0)
+    }
+
+    private fun scheduleExpressRender(immediate: Boolean = false) {
+        handler.removeCallbacks(streamingRenderTick)
+        if (stage != Stage.EXPRESS) return
+        if (immediate) render() else handler.postDelayed(streamingRenderTick, 120L)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_MIC) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                if (gptConnected) startGptVoiceCapture() else connectGpt()
+            } else {
+                toast("Microphone permission required to start calling")
+            }
+        }
     }
 
     private fun addRequirement(values: MutableList<String>, raw: String) {
@@ -1184,6 +1915,8 @@ class MainActivity : Activity() {
                 selectedImageUri = null
                 selectedImageName = null
                 imageStyleSignal = null
+                uploadedImageId = null
+                imageUploadInFlight = false
                 mustHaves.apply { clear(); addAll(listOf("Budget up to ¥7,000", "Design-studio use", "Strong display", "16GB RAM preferred")) }
                 preferences.apply { clear(); addAll(listOf("Portable for campus", "Long battery life", "Silver or neutral style")) }
                 osPreference = "No preference"
@@ -1203,6 +1936,9 @@ class MainActivity : Activity() {
                 analysisPaused = false
                 scrollPositions.clear()
                 currentScrollView = null
+                chatLines.clear()
+                streamingAssistant = ""
+                streamingUserPartial = ""
                 stage = Stage.EXPRESS
                 render()
             }
@@ -1266,9 +2002,12 @@ class MainActivity : Activity() {
                 selectedImageUri = uri.toString()
                 selectedImageName = displayName(uri)
                 imageStyleSignal = null
+                uploadedImageId = null
+                invalidateResults()
                 contextSignalChanged()
                 render()
                 analyzeImageStyleAsync(uri)
+                uploadSelectedImageAsync(uri)
             }
         }
     }
@@ -1286,7 +2025,7 @@ class MainActivity : Activity() {
         imageExecutor.execute {
             val signal = analyzeImageStyle(uri) ?: "Visual reference"
             handler.post {
-                if (!isDestroyed && selectedImageUri == uriString) {
+                if (!isDestroyed && selectedImageUri == uriString && uploadedImageId == null) {
                     imageStyleSignal = signal
                     render()
                 }
@@ -1443,6 +2182,15 @@ class MainActivity : Activity() {
     companion object {
         private const val REQUEST_VOICE = 1001
         private const val REQUEST_IMAGE = 1002
+        private const val REQUEST_MIC = 1003
+        // Android emulator → host machine loopback (verified working).
+        // Physical device on same Wi-Fi: use http://192.168.31.199:8000 instead.
+        // private const val BACKEND_BASE_URL = "http://127.0.0.1:8000"
+        private const val BACKEND_BASE_URL = "http://10.0.2.2:8000"
+        /** Mic RMS above this while assistant is talking → local barge-in (emulator-friendly). */
+        private const val LOCAL_BARGE_IN_RMS = 1800.0
+        private const val IMAGE_UPLOAD_MAX_SIDE = 1024
+        private const val IMAGE_UPLOAD_JPEG_QUALITY = 82
         private const val SAMPLE_NEED = "I need a laptop for design studies with a budget of ¥7,000 RMB. I care about display quality, 16GB memory, and portability."
     }
 }

@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VoiceShop++ PC 通话测试</title>
+  <style>
+    :root {
+      --bg: #12151c;
+      --panel: #1b2130;
+      --text: #e8edf7;
+      --muted: #9aa6bd;
+      --accent: #3d8bfd;
+      --ok: #3ecf8e;
+      --bad: #ff6b6b;
+      --line: #2a3348;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(1000px 500px at 10% -10%, #243153 0%, transparent 55%),
+        radial-gradient(800px 400px at 100% 0%, #1a3a36 0%, transparent 50%),
+        var(--bg);
+      color: var(--text);
+    }
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.6rem;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+    }
+    .sub { color: var(--muted); margin-bottom: 24px; line-height: 1.5; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 12px 18px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--accent);
+      color: white;
+    }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.stop { background: #5a6478; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #666;
+    }
+    .dot.on { background: var(--ok); box-shadow: 0 0 0 4px rgba(62, 207, 142, 0.15); }
+    .dot.err { background: var(--bad); }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 16px;
+      min-height: 280px;
+      white-space: pre-wrap;
+      line-height: 1.55;
+      font-size: 0.95rem;
+    }
+    .you { color: #9ec1ff; }
+    .bot { color: #9ef0c7; }
+    .sys { color: var(--muted); }
+    .hint { margin-top: 14px; color: var(--muted); font-size: 0.85rem; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>VoiceShop++ PC 通话测试</h1>
+    <p class="sub">用电脑麦克风直接连本机后端（同一套 Qwen Omni Realtime），无需 Android 模拟器。</p>
+
+    <div class="row">
+      <button id="btnStart">开始通话</button>
+      <button id="btnStop" class="stop" disabled>结束通话</button>
+      <span class="pill"><span id="statusDot" class="dot"></span><span id="statusText">未连接</span></span>
+    </div>
+
+    <div id="log" class="panel"></div>
+    <p class="hint">
+      浏览器会请求麦克风权限。请用 Chrome / Edge 打开本页。<br />
+      后端需已启动：<code>py -3 server.py --port 8000</code>，然后访问
+      <code>http://127.0.0.1:8000/voice-test</code>
+    </p>
+  </main>
+
+  <script>
+    const INPUT_RATE = 16000;
+    const OUTPUT_RATE = 24000;
+
+    const btnStart = document.getElementById("btnStart");
+    const btnStop = document.getElementById("btnStop");
+    const statusDot = document.getElementById("statusDot");
+    const statusText = document.getElementById("statusText");
+    const logEl = document.getElementById("log");
+
+    let ws = null;
+    let mediaStream = null;
+    let audioCtx = null;
+    let processor = null;
+    let sourceNode = null;
+    let playCtx = null;
+    let nextPlayTime = 0;
+    let assistantBuf = "";
+    let userPartial = "";
+
+    function setStatus(text, kind) {
+      statusText.textContent = text;
+      statusDot.className = "dot" + (kind === "on" ? " on" : kind === "err" ? " err" : "");
+    }
+
+    function appendLog(text, cls) {
+      const line = document.createElement("div");
+      line.className = cls || "sys";
+      line.textContent = text;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function floatTo16BitPCM(float32) {
+      const out = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return out;
+    }
+
+    function downsampleTo16k(float32, inRate) {
+      if (inRate === INPUT_RATE) return float32;
+      const ratio = inRate / INPUT_RATE;
+      const newLen = Math.round(float32.length / ratio);
+      const result = new Float32Array(newLen);
+      for (let i = 0; i < newLen; i++) {
+        const idx = Math.floor(i * ratio);
+        result[i] = float32[idx];
+      }
+      return result;
+    }
+
+    function pcm16ToBase64(int16) {
+      const bytes = new Uint8Array(int16.buffer);
+      let binary = "";
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      return btoa(binary);
+    }
+
+    function base64ToInt16(b64) {
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return new Int16Array(bytes.buffer);
+    }
+
+    function ensurePlayCtx() {
+      if (!playCtx) {
+        playCtx = new AudioContext({ sampleRate: OUTPUT_RATE });
+        nextPlayTime = 0;
+      }
+      if (playCtx.state === "suspended") playCtx.resume();
+      return playCtx;
+    }
+
+    function playPcm16(int16) {
+      const ctx = ensurePlayCtx();
+      const f32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+      const buffer = ctx.createBuffer(1, f32.length, OUTPUT_RATE);
+      buffer.copyToChannel(f32, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      const now = ctx.currentTime;
+      if (nextPlayTime < now) nextPlayTime = now + 0.02;
+      src.start(nextPlayTime);
+      nextPlayTime += buffer.duration;
+    }
+
+    function interruptPlayback() {
+      if (playCtx) {
+        playCtx.close().catch(() => {});
+        playCtx = null;
+        nextPlayTime = 0;
+      }
+    }
+
+    function sendJson(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    }
+
+    async function startMic() {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          channelCount: 1,
+        },
+      });
+      audioCtx = new AudioContext();
+      sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+      processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processor.onaudioprocess = (e) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const input = e.inputBuffer.getChannelData(0);
+        const down = downsampleTo16k(input, audioCtx.sampleRate);
+        const pcm = floatTo16BitPCM(down);
+        sendJson({ type: "input_audio_buffer.append", audio: pcm16ToBase64(pcm) });
+      };
+      // Keep the graph alive without monitoring the mic locally.
+      const mute = audioCtx.createGain();
+      mute.gain.value = 0;
+      sourceNode.connect(processor);
+      processor.connect(mute);
+      mute.connect(audioCtx.destination);
+    }
+
+    function stopMic() {
+      try { processor && processor.disconnect(); } catch (_) {}
+      try { sourceNode && sourceNode.disconnect(); } catch (_) {}
+      if (audioCtx) audioCtx.close().catch(() => {});
+      if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
+      processor = null;
+      sourceNode = null;
+      audioCtx = null;
+      mediaStream = null;
+    }
+
+    function handleEvent(ev) {
+      const t = ev.type || "";
+      if (t === "input_audio_buffer.speech_started") {
+        interruptPlayback();
+        assistantBuf = "";
+        appendLog("[VAD] 检测到说话", "sys");
+      } else if (t === "conversation.item.input_audio_transcription.delta") {
+        const d = ev.delta || ev.text || "";
+        if (d) {
+          userPartial += d;
+          // live partial is noisy; only show finals for clarity
+        }
+      } else if (t === "conversation.item.input_audio_transcription.completed") {
+        const text = (ev.transcript || ev.text || userPartial || "").trim();
+        userPartial = "";
+        if (text) appendLog("You: " + text, "you");
+      } else if (
+        t === "response.output_audio.delta" || t === "response.audio.delta"
+      ) {
+        if (ev.delta) playPcm16(base64ToInt16(ev.delta));
+      } else if (
+        t === "response.output_audio_transcript.delta" ||
+        t === "response.audio_transcript.delta" ||
+        t === "response.output_text.delta" ||
+        t === "response.text.delta"
+      ) {
+        if (ev.delta) assistantBuf += ev.delta;
+      } else if (
+        t === "response.output_audio_transcript.done" ||
+        t === "response.audio_transcript.done" ||
+        t === "response.output_text.done" ||
+        t === "response.text.done"
+      ) {
+        const full = (ev.transcript || ev.text || assistantBuf || "").trim();
+        assistantBuf = "";
+        if (full) appendLog("Assistant: " + full, "bot");
+      } else if (t === "error") {
+        const msg = (ev.error && ev.error.message) || ev.message || JSON.stringify(ev);
+        appendLog("Error: " + msg, "sys");
+        setStatus("出错", "err");
+      }
+    }
+
+    async function startCall() {
+      btnStart.disabled = true;
+      setStatus("创建会话…", "");
+      appendLog("正在创建 session…", "sys");
+      try {
+        const res = await fetch("/api/v1/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(JSON.stringify(body));
+        const sid = body.session_id;
+        const wsPath = (body.ws_url || "/api/v1/qwen/realtime/ws").split("?")[0];
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${proto}//${location.host}${wsPath}?session_id=${sid}`;
+        appendLog("session_id=" + sid, "sys");
+        setStatus("连接 WebSocket…", "");
+
+        await new Promise((resolve, reject) => {
+          ws = new WebSocket(wsUrl);
+          ws.onopen = () => resolve();
+          ws.onerror = () => reject(new Error("WebSocket 连接失败"));
+          ws.onclose = () => {
+            setStatus("已断开", "err");
+            btnStart.disabled = false;
+            btnStop.disabled = true;
+            stopMic();
+          };
+          ws.onmessage = (msg) => {
+            try { handleEvent(JSON.parse(msg.data)); }
+            catch (e) { appendLog("Bad event: " + e, "sys"); }
+          };
+        });
+
+        // Ensure Tina for qwen3.5 (Cherry is rejected by this model).
+        sendJson({
+          type: "session.update",
+          session: {
+            modalities: ["text", "audio"],
+            voice: "Tina",
+            instructions: "You are VoiceShop++, a helpful retail shopping assistant. Always reply in English only. Help clarify product category, budget, must-haves, and constraints. Keep replies short.",
+            input_audio_format: "pcm",
+            output_audio_format: "pcm",
+            input_audio_transcription: { model: "qwen3-asr-flash-realtime", language: "en" },
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.4,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 800,
+            },
+          },
+        });
+        appendLog("session.update voice=Tina", "sys");
+
+        await startMic();
+        setStatus("通话中 — 请说话", "on");
+        appendLog("已连接。请对着电脑麦克风说话。", "sys");
+        btnStop.disabled = false;
+      } catch (err) {
+        appendLog("启动失败: " + err.message, "sys");
+        setStatus("失败", "err");
+        btnStart.disabled = false;
+        stopCall();
+      }
+    }
+
+    function stopCall() {
+      try { if (ws) ws.close(); } catch (_) {}
+      ws = null;
+      stopMic();
+      interruptPlayback();
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      setStatus("未连接", "");
+    }
+
+    btnStart.addEventListener("click", startCall);
+    btnStop.addEventListener("click", stopCall);
+  </script>
+</body>
+</html>

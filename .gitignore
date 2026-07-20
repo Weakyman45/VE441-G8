@@ -6,3 +6,8 @@ local.properties
 captures/
 *.iml
 app/build/
+
+# Secrets — never commit API keys
+.env
+backend/.env
+**/.env
