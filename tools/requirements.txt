@@ -1,0 +1,5 @@
+# Only needed for ONLINE mode (streaming from HuggingFace).
+# OFFLINE mode (--input a local meta_*.jsonl.gz) needs nothing but the
+# Python standard library, so you can skip installing these.
+datasets>=2.19.0
+huggingface_hub>=0.23.0

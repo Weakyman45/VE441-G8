@@ -1,0 +1,12 @@
+Place the generated `laptops.db` in THIS folder (app/src/main/assets/).
+
+Generate it with:
+    cd tools
+    pip install -r requirements.txt
+    python build_laptops.py --limit 500 --out ../app/src/main/assets/laptops.db
+
+At runtime MainActivity checks assets for "laptops.db":
+  - found    -> loads the Amazon Reviews 2023 laptop subset from SQLite
+  - missing  -> falls back to the built-in 5-laptop demo catalog
+
+You may delete this note once laptops.db is in place.

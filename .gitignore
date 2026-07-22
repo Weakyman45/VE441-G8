@@ -1,0 +1,17 @@
+.gradle/
+build/
+local.properties
+.idea/
+.kotlin/
+captures/
+*.iml
+app/build/
+
+# Secrets — never commit API keys
+.env
+backend/.env
+**/.env
+
+# Large raw dataset dumps (re-downloadable via tools/download_all.py) — do not commit
+tools/*.jsonl
+tools/*.jsonl.gz
