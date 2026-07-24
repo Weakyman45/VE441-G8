@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 from ..bus import EventBus
 from ..events import Event, EventType
 from ..logging_store import LoggingStore
+from ..retrieval import merge_candidates, retrieve_text, retrieve_visual
 from ..session import SessionStore
 from . import planner
 from ..recommend_agent import rank_products
-from .search_worker import run_search
 
 
 class WorkerRuntime:
@@ -21,12 +22,12 @@ class WorkerRuntime:
         bus: EventBus,
         sessions: SessionStore,
         logs: LoggingStore,
-        search_fn: Callable[[dict], list[dict]],
+        catalog_fn: Callable[[], list[dict]],
     ) -> None:
         self.bus = bus
         self.sessions = sessions
         self.logs = logs
-        self.search_fn = search_fn
+        self.catalog_fn = catalog_fn
         self._cancel: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
         # Intent update already follows each utterance from TalkerBridge.
@@ -91,29 +92,53 @@ class WorkerRuntime:
             Event(
                 type=EventType.WORKER_STATUS,
                 session_id=session_id,
-                payload={"status": "searching", "message": "Searching catalog", "plan_id": plan_id},
+                payload={"status": "searching", "message": "Retrieving catalog matches", "plan_id": plan_id},
             )
         )
         if cancel.is_set():
             return
 
         t1 = time.time()
-        self.sessions.set_worker_status(session_id, "searching", "Searching products", plan_id=plan_id)
+        self.sessions.set_worker_status(session_id, "searching", "Retrieving text and visual matches", plan_id=plan_id)
         try:
-            candidates = run_search(
-                state.preference,
-                self.search_fn,
-                query_hint=plan.get("query_hint"),
+            catalog = self.catalog_fn()
+            # Text and visual retrieval are independent worker tasks. Run them
+            # together, then merge their candidates before recommendation.
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="catalog-retrieval") as pool:
+                text_future = pool.submit(
+                    retrieve_text,
+                    state.preference,
+                    catalog,
+                    query_hint=plan.get("query_hint"),
+                    limit=80,
+                )
+                visual_future = pool.submit(
+                    retrieve_visual,
+                    state.preference,
+                    catalog,
+                    state.image_refs,
+                    limit=80,
+                )
+                text_candidates = text_future.result()
+                visual_candidates = visual_future.result()
+            candidates = merge_candidates(
+                text_candidates,
+                visual_candidates,
+                limit=80,
             )
         except Exception as exc:
-            self.logs.log_trace(session_id, "search", "error", {"error": str(exc)}, plan_id=plan_id)
-            self.sessions.set_worker_status(session_id, "idle", f"Search failed: {exc}", plan_id=plan_id)
+            self.logs.log_trace(session_id, "retrieval", "error", {"error": str(exc)}, plan_id=plan_id)
+            self.sessions.set_worker_status(session_id, "idle", f"Retrieval failed: {exc}", plan_id=plan_id)
             return
         self.logs.log_trace(
             session_id,
-            "search",
+            "retrieval",
             "candidates_ready",
-            {"count": len(candidates)},
+            {
+                "count": len(candidates),
+                "text_count": len(text_candidates),
+                "visual_count": len(visual_candidates),
+            },
             latency_ms=(time.time() - t1) * 1000,
             plan_id=plan_id,
         )
@@ -121,7 +146,12 @@ class WorkerRuntime:
             Event(
                 type=EventType.WORKER_CANDIDATES_READY,
                 session_id=session_id,
-                payload={"plan_id": plan_id, "count": len(candidates)},
+                payload={
+                    "plan_id": plan_id,
+                    "count": len(candidates),
+                    "text_count": len(text_candidates),
+                    "visual_count": len(visual_candidates),
+                },
             )
         )
         if cancel.is_set():

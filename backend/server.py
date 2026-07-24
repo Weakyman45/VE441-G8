@@ -189,12 +189,16 @@ def mint_realtime_token() -> dict:
     }
 
 
-def _row_to_dict(row: sqlite3.Row) -> dict:
+def _row_to_dict(row: sqlite3.Row, *, include_embeddings: bool = False) -> dict:
     available = set(row.keys())
     item = {key: row[key] if key in available else None for key in COLUMNS}
     for key in ENRICHMENT_COLUMNS:
         if key in available:
             item[key] = row[key]
+    if include_embeddings:
+        for key in ("image_embedding", "review_embedding"):
+            if key in available:
+                item[key] = row[key]
     for field in ("reasons", "trade_offs"):
         raw = item.get(field) or ""
         item[field] = [p.strip() for p in raw.split("||") if p.strip()]
@@ -290,6 +294,20 @@ def search(params: dict) -> list[dict]:
     try:
         rows = conn.execute(sql, args).fetchall()
         return [_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def catalog_rows() -> list[dict]:
+    """Return the complete enriched catalog for internal retrieval workers.
+
+    Embeddings are intentionally available only through this in-process helper;
+    REST product/search responses continue to omit the large vector payloads.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT * FROM laptops").fetchall()
+        return [_row_to_dict(row, include_embeddings=True) for row in rows]
     finally:
         conn.close()
 
@@ -854,7 +872,7 @@ def main() -> None:
             f"catalog db not found: {DB_PATH}\nBuild it first with tools/build_laptops.py"
         )
 
-    WORKER_RUNTIME = WorkerRuntime(EVENT_BUS, SESSION_STORE, LOG_STORE, search)
+    WORKER_RUNTIME = WorkerRuntime(EVENT_BUS, SESSION_STORE, LOG_STORE, catalog_rows)
     WORKER_RUNTIME.start()
 
     total = count()
@@ -862,7 +880,7 @@ def main() -> None:
     print(f"VoiceShop++ backend serving {total} laptops")
     print(f"Listening on http://{args.host}:{args.port}  (db={DB_PATH})")
     print(f"Talker provider: {TALKER_PROVIDER}  (LLM agents: Qwen)")
-    print("Engine: Talker + Worker(Planner→Search→Recommend)")
+    print("Engine: Talker + Worker(Text Retrieval + Visual Retrieval → Merge → Recommend)")
     print("REST: /api/v1/session  /api/v1/session/{id}/recommendations")
     print(f"WS default: {default_talker_ws_path()}?session_id=...")
     print("WS Qwen:    /api/v1/qwen/realtime/ws")

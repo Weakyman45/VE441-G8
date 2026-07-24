@@ -110,11 +110,20 @@ adb reverse tcp:8000 tcp:8000
 curl.exe -s http://localhost:8000/health
 ```
 
-## Recommend Agent 边界
+## Retrieval + Recommend Agent 边界
 
-本组只实现最终 `Recommend Agent`。入口是
+本组实现 Text Retrieval、Visual Retrieval、候选合并和最终 `Recommend Agent`，不实现
+Planner、Enrichment、Reviewer 或 Reject/Verify Agent。Recommend 入口是
 `engine.recommend_agent.rank_products(plan_id, profile, candidates)`。它假定候选商品已由上游
 Text/Visual Retrieval 合并，并由 Reject/Verify Agent 检查品类和 must-have。
+
+- Text Retrieval 对 `name`、`enriched_text`、`visual_attrs`、规格和评论字段做加权关键词检索，
+  输出归一化的 `text_similarity`。
+- Visual Retrieval 使用 DashScope `multimodal-embedding-v1` 生成查询图片向量，只对相同维度的
+  商品向量计算余弦相似度；维度不同或在线向量不可用时，使用 `visual_attrs` / `enriched_text`
+  做视觉属性匹配。
+- Merge 按商品 ID 合并、去重两路候选，并保留 `text_similarity`、`visual_similarity`、来源和
+  各路排名；不会执行 must-have 拒绝。
 
 候选可携带以下上游字段:
 
