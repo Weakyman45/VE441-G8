@@ -18,6 +18,10 @@ class PreferenceProfile:
     # English keywords for matching the (English) product catalog. Filled by the
     # LLM brief so a Chinese/voice request still yields catalog-searchable terms.
     search_keywords: list[str] = field(default_factory=list)
+    # Prior user requests/preferences retained within the current session.  The
+    # Recommend Agent uses this as a weak personalization signal; it is not a
+    # replacement for an opt-in, persistent user profile.
+    preference_history: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -32,11 +36,18 @@ class RankedProduct:
     reasons: list[str]
     summary: str = ""
     rating: float = 0.0
+    rating_number: int = 0
     platform: str = "Windows"
     display: str = ""
     performance: str = ""
+    battery: str = ""
     weight_kg: float = 0.0
     image_url: str = ""
+    score_breakdown: dict[str, float] = field(default_factory=dict)
+    review_summary: str = ""
+    review_pros: list[str] = field(default_factory=list)
+    review_cons: list[str] = field(default_factory=list)
+    review_issues: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -49,6 +60,7 @@ class RecommendationBundle:
     excluded: list[dict[str, str]] = field(default_factory=list)
     summary: str = ""
     status: str = "ready"
+    ranking_policy: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +69,7 @@ class RecommendationBundle:
             "excluded": self.excluded,
             "summary": self.summary,
             "status": self.status,
+            "ranking_policy": self.ranking_policy,
         }
 
 

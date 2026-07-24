@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
-$DbPath = Join-Path $Root "backend\data\catalog.db"
+$DbPath = Join-Path $Root "catalog.db"
 $EnvPath = Join-Path $Root "backend\.env"
 
 Write-Host "VoiceShop++ backend"
@@ -20,7 +20,7 @@ catalog database not found:
   $DbPath
 
 Build or copy the database first:
-  python tools\build_laptops.py --input tools\meta_Electronics_part.jsonl.gz --limit 500 --out backend\data\catalog.db
+  Place the enriched catalog.db in the project root, or rebuild it there.
 "@
 }
 

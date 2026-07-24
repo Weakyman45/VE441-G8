@@ -4,14 +4,14 @@ VoiceShop++ is a real-time multimodal shopping copilot. It helps shoppers state 
 
 ## Getting Started
 
-This repository includes a runnable Android frontend prototype in `app/`. The current client uses a local laptop catalog so the complete shopping experience can be evaluated without API keys or a backend service.
+This repository includes a runnable Android frontend in `app/` and a local Python backend. The backend reads the enriched `catalog.db` in the project root; catalog search and deterministic recommendation work without API keys, while Qwen/OpenAI voice and multimodal analysis require provider credentials.
 
 Requirements:
 
 - Android Studio with Android SDK 35
 - JDK 17 or newer (Android Studio's bundled JDK is sufficient)
 
-To run the app, open the repository in Android Studio, allow Gradle to sync, select an Android 13+ emulator or device, and run the `app` configuration.
+Start the backend with `python backend/server.py`, then open the repository in Android Studio, allow Gradle to sync, select an Android 13+ emulator or device, and run the `app` configuration. The emulator connects to the host backend at `http://10.0.2.2:8000`.
 
 To build from the command line:
 
@@ -136,31 +136,21 @@ MVP feature: Evidence-Backed Multi-Agent Recommendation and Dynamic Refinement.
 
 ```mermaid
 flowchart LR
-    U["Shopper"] --> C["Android Client"]
-    C -->|REST setup, image upload, detail queries| R["REST Controller"]
-    C -->|PCM audio chunks and control frames| W["WebSocket Session Controller"]
-    W --> A["Audio Pipeline: VAD, ASR, TTS"]
-    A --> D["Dialogue and Intent Parser"]
-    R --> I["Image and Product Context"]
-    D --> P["Preference Profile Store"]
-    I --> P
-    P --> O["Orchestrator and Planner"]
-    O --> S["Search Agent"]
-    O --> V["Review Analysis Agent"]
-    O --> X["Specs and Comparison Agent"]
-    O --> M["Price and Deal Agent"]
-    S --> DS["Product Catalog and Search APIs"]
-    V --> DR["Review Index"]
-    X --> DS
-    M --> DP["Price Sources"]
-    DS --> G["Recommendation Agent"]
-    DR --> G
-    DP --> G
-    P --> G
-    G --> B["Recommendation Bundle"]
-    B --> W
-    W -->|transcript, status, recommendations, text and audio reply| C
-    B --> H["Session History and Decision Report"]
+    U["Talker: text and/or photo"] --> P["Planner: classify input and route tasks"]
+    E["Enrichment Agent: image embeddings and product attributes"] --> DB["Enriched catalog.db"]
+    RV["Reviewer Agent: review pros, cons, and issues"] --> DB
+    DB --> T["Text Retrieval Worker"]
+    DB --> V["Visual Retrieval Worker"]
+    P --> T
+    P --> V
+    T --> M["Merge candidates"]
+    V --> M
+    M --> Q["Reject / Verify Agent: category and must-haves"]
+    RV --> Q
+    Q --> G["Recommend Agent"]
+    P -->|"nice-to-haves and session preference history"| G
+    V -->|"normalized visual similarity"| G
+    G --> B["Ranked recommendation bundle with explanations"]
 ```
 
 ### Engine Blocks
@@ -178,7 +168,7 @@ flowchart LR
 | Review Analysis Agent | Aggregates reviews into evidence-backed pros, cons, aspect scores, and warnings. Low-volume or missing evidence is surfaced as low confidence. |
 | Specs and Comparison Agent | Compares relevant product attributes such as CPU, GPU, memory, storage, display, battery life, weight, warranty, and platform compatibility. |
 | Price and Deal Agent | Checks current price and, when available, price history or deal signals. It flags price-unavailable states rather than blocking recommendations. |
-| Recommendation Agent | Synthesizes product candidates, profile data, specs, reviews, and price signals into a ranked recommendation bundle with explanations and excluded-candidate reasons. |
+| Recommendation Agent | Ranks upstream-verified candidates using visual similarity, nice-to-have coverage, review-backed quality, price fit, and session preference history. It returns deterministic score breakdowns and evidence-backed explanations. |
 | Session History and Decision Report | Stores session summaries, the final shortlist, selected product, tradeoffs, risk checklist, and optional shareable decision report. |
 
 ## APIs and Controller

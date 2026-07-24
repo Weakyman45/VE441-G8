@@ -4,14 +4,14 @@
 只用 Python 标准库(`http.server` + `sqlite3` + `json`),所以**不需要 `pip install`、不需要联网**即可运行。
 
 > 说明:后端直接在**本地(Windows)**上跑,数据库用项目内的相对路径加载
-> (`backend/data/catalog.db`),不依赖任何机器专属路径。任何人克隆本仓库后都能直接跑通。
+> (`catalog.db`, 项目根目录),不依赖任何机器专属路径。任何人拿到数据库后都能直接跑通。
 
 ## 目录结构
 
 ```
 backend/
   server.py            # API 服务(标准库)
-  data/catalog.db      # 商品数据库(由 tools/build_laptops.py 生成)
+../catalog.db          # Enrichment/Reviewer 生成的增强商品数据库
 tools/
   build_laptops.py     # 从 Amazon 数据集抽取笔记本 -> SQLite
   verify_db.py         # 快速查看 db 行数与样例
@@ -19,13 +19,17 @@ tools/
 
 ## 0. 准备数据库(第一次运行前)
 
-仓库不包含 `backend/data/catalog.db`,需要先生成一次。数据库现在是**通用商品目录**
+运行时默认读取项目根目录的 `catalog.db`。数据库现在是**通用商品目录**
 (不再只有笔记本),用户输入什么品类就能搜到什么,取决于你下载了哪些品类文件。
 
-最省事:一键下载所有品类前 250MB 并自动构建(在项目根目录):
+当前运行库就是项目根目录的增强版 `catalog.db`。如果需要从 Amazon 原始数据重建，
+下载/构建脚本先生成基础库，再由 Enrichment Agent 和 Reviewer Agent 写入增强字段；
+不要直接覆盖当前增强库。
+
+生成基础库:
 
 ```powershell
-python tools\download_all.py
+python tools\download_all.py --out backend\data\catalog.db
 ```
 
 或自己挑品类、手动构建(详见 `tools/README.md`):
@@ -35,11 +39,11 @@ python tools\download_all.py
 curl.exe -r 0-262144000 -o tools\meta_Electronics_part.jsonl.gz "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/raw/meta_categories/meta_Electronics.jsonl.gz"
 curl.exe -r 0-262144000 -o tools\meta_Cell_Phones_and_Accessories_part.jsonl.gz "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/raw/meta_categories/meta_Cell_Phones_and_Accessories.jsonl.gz"
 
-# 一次喂入多个品类文件构建(--limit 是合计上限)
+# 一次喂入多个品类文件构建基础库(--limit 是合计上限)
 python tools\build_laptops.py --input tools\meta_Electronics_part.jsonl.gz tools\meta_Cell_Phones_and_Accessories_part.jsonl.gz --limit 3000 --out backend\data\catalog.db
 ```
 
-(若已有别人生成好的 `catalog.db`,直接拷到 `backend\data\catalog.db` 即可。)
+(若已有 Enrichment/Reviewer 生成好的 `catalog.db`,直接放到项目根目录即可。)
 
 ## 1. 启动后端(本地 Windows)
 
@@ -106,6 +110,25 @@ adb reverse tcp:8000 tcp:8000
 curl.exe -s http://localhost:8000/health
 ```
 
+## Recommend Agent 边界
+
+本组只实现最终 `Recommend Agent`。入口是
+`engine.recommend_agent.rank_products(plan_id, profile, candidates)`。它假定候选商品已由上游
+Text/Visual Retrieval 合并，并由 Reject/Verify Agent 检查品类和 must-have。
+
+候选可携带以下上游字段:
+
+| 字段 | 含义 |
+|------|------|
+| `verified` / `rejection_reason` | Reject/Verify Agent 的结果；显式拒绝的候选不会进入排名 |
+| `visual_similarity` | Visual Retrieval 计算并归一化到 0..1 的图片相似度 |
+| `text_similarity` | Text Retrieval 分数，仅作为同分时的稳定排序依据 |
+
+最终分数由图片相似度 30%、nice-to-have 25%、质量/评论 20%、价格匹配 15%、
+会话内偏好历史 10% 组成。某个信号缺失时，其权重会从该候选中移除并重新归一化。
+Recommend Agent 会读取增强库里的 `visual_attrs`、`enriched_text`、`review_aspects`、
+`review_count_used`，但不会自行做向量检索或 must-have 验证。
+
 ## 4. 扩充 / 重建数据(更多品类或更多商品)
 
 想覆盖更多品类,就多下载几个 `meta_<Category>.jsonl.gz`(命名规则和完整品类列表见
@@ -117,7 +140,7 @@ curl.exe -r 0-262144000 -o tools\meta_Clothing_Shoes_and_Jewelry_part.jsonl.gz "
 curl.exe -r 0-262144000 -o tools\meta_Home_and_Kitchen_part.jsonl.gz "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/raw/meta_categories/meta_Home_and_Kitchen.jsonl.gz"
 curl.exe -r 0-262144000 -o tools\meta_Sports_and_Outdoors_part.jsonl.gz "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/raw/meta_categories/meta_Sports_and_Outdoors.jsonl.gz"
 
-# 重建(把所有想要的品类文件都列上,--limit 是合计上限)
+# 重建基础库(把所有想要的品类文件都列上,--limit 是合计上限)
 python tools\build_laptops.py --input tools\meta_*.jsonl.gz --limit 8000 --out backend\data\catalog.db
 
 # 查看结果
@@ -127,7 +150,8 @@ python tools\verify_db.py backend\data\catalog.db
 > PowerShell 不会自动展开 `tools\meta_*.jsonl.gz` 通配符,手动把各文件列全,或用
 > `--input (Get-ChildItem tools\meta_*.jsonl.gz).FullName`。
 
-后端每次请求都重新读库,重建后**无需重启**即可生效。
+基础库经过 Enrichment/Reviewer 后输出为项目根目录 `catalog.db`。后端每次请求重新读运行库，
+替换完成后**无需重启**即可生效。
 
 ## 说明 / 已知限制
 

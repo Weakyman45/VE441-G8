@@ -8,6 +8,10 @@ from .models import PreferenceProfile
 
 def extract_preference(text: str, prior: PreferenceProfile | None = None) -> PreferenceProfile:
     """Rule-based preference extraction (Phase 1 — no LLM required)."""
+    history = list(prior.preference_history) if prior else []
+    if prior and prior.raw_query.strip() and prior.raw_query.strip() != text.strip():
+        history.append(prior.raw_query.strip())
+        history = list(dict.fromkeys(history))[-20:]
     profile = PreferenceProfile(
         category=(prior.category if prior else ""),
         budget=prior.budget if prior else None,
@@ -19,6 +23,7 @@ def extract_preference(text: str, prior: PreferenceProfile | None = None) -> Pre
         visual_context=prior.visual_context if prior else "",
         raw_query=text.strip(),
         search_keywords=list(prior.search_keywords) if prior else [],
+        preference_history=history,
     )
     lower = text.lower()
 

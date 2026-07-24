@@ -2152,27 +2152,40 @@ class MainActivity : Activity() {
         val mapped = ArrayList<Laptop>(ranked.length())
         for (i in 0 until ranked.length()) {
             val item = ranked.optJSONObject(i) ?: continue
+            val ratingNumber = item.optInt("rating_number", 0)
+            val reviewPros = jsonArrayToList(item.optJSONArray("review_pros"))
+            val reviewCons = jsonArrayToList(item.optJSONArray("review_cons"))
+            val reviewIssues = jsonArrayToList(item.optJSONArray("review_issues"))
             mapped.add(
                 Laptop(
                     id = item.optString("id").ifBlank { "w$i" },
                     name = item.optString("name").ifBlank { "Product" },
                     price = item.optInt("price", 0),
-                    match = item.optInt("score", 80).coerceIn(60, 99),
+                    match = item.optInt("score", 80).coerceIn(0, 99),
                     rating = item.optDouble("rating", 0.0),
-                    reviewCount = "Worker match",
+                    reviewCount = if (ratingNumber > 0) {
+                        "%,d reviews".format(Locale.US, ratingNumber)
+                    } else {
+                        "Recommend Agent match"
+                    },
                     display = item.optString("display").ifBlank { "Not specified" },
                     performance = item.optString("performance").ifBlank { "Not specified" },
-                    battery = "Not specified",
+                    battery = item.optString("battery").ifBlank { "Not specified" },
                     weightKg = item.optDouble("weight_kg", 0.0),
                     summary = item.optString("summary").ifBlank {
                         item.optJSONArray("reasons")?.optString(0) ?: "Worker recommendation"
                     },
-                    reviewSentiment = "Ranked by Worker runtime",
-                    weakness = "See trade-offs in details",
+                    reviewSentiment = item.optString("review_summary").ifBlank {
+                        reviewPros.firstOrNull() ?: "Ranked by the Recommend Agent"
+                    },
+                    weakness = reviewCons.firstOrNull()
+                        ?: reviewIssues.firstOrNull()
+                        ?: "No verified issue in the available review evidence.",
                     reasons = jsonArrayToList(item.optJSONArray("reasons")).ifEmpty { listOf("Worker match") },
-                    tradeOffs = listOf("Confirm specs before purchase"),
+                    tradeOffs = (reviewCons + reviewIssues).distinct().take(5)
+                        .ifEmpty { listOf("Confirm specs before purchase") },
                     color = catalogColors[i % catalogColors.size],
-                    platform = item.optString("platform").ifBlank { "Windows" },
+                    platform = item.optString("platform").ifBlank { "Not specified" },
                     imageUrl = item.optString("image_url").trim()
                 )
             )

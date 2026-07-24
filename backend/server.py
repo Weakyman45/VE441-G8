@@ -50,7 +50,10 @@ from engine.talker.bridge import TalkerBridge
 from engine.worker.runtime import WorkerRuntime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DB = os.path.join(HERE, "data", "catalog.db")
+PROJECT_ROOT = os.path.dirname(HERE)
+# The enriched catalog produced by the Enrichment/Reviewer agents lives at the
+# repository root.  ``--db`` can still override this for fixtures or migration.
+DEFAULT_DB = os.path.join(PROJECT_ROOT, "catalog.db")
 ENV_FILE = os.path.join(HERE, ".env")
 ENGINE_LOG_DB = os.path.join(HERE, "data", "engine_logs.db")
 VOICE_TEST_HTML = os.path.join(HERE, "static", "voice_test.html")
@@ -99,6 +102,9 @@ COLUMNS = [
     "id", "name", "price", "rating", "rating_number", "display", "performance",
     "battery", "weight_kg", "summary", "review_sentiment", "weakness",
     "reasons", "trade_offs", "store", "image_url", "platform",
+]
+ENRICHMENT_COLUMNS = [
+    "visual_attrs", "enriched_text", "review_aspects", "review_count_used",
 ]
 
 DB_PATH = DEFAULT_DB
@@ -184,10 +190,21 @@ def mint_realtime_token() -> dict:
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
-    item = {key: row[key] for key in COLUMNS}
+    available = set(row.keys())
+    item = {key: row[key] if key in available else None for key in COLUMNS}
+    for key in ENRICHMENT_COLUMNS:
+        if key in available:
+            item[key] = row[key]
     for field in ("reasons", "trade_offs"):
         raw = item.get(field) or ""
         item[field] = [p.strip() for p in raw.split("||") if p.strip()]
+    for field in ("visual_attrs", "review_aspects"):
+        raw = item.get(field)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                item[field] = json.loads(raw)
+            except json.JSONDecodeError:
+                pass
     return item
 
 

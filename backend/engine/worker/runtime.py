@@ -9,7 +9,7 @@ from ..events import Event, EventType
 from ..logging_store import LoggingStore
 from ..session import SessionStore
 from . import planner
-from .recommend_worker import rank_products
+from ..recommend_agent import rank_products
 from .search_worker import run_search
 
 

@@ -6,7 +6,7 @@ cd /d "%~dp0"
 set "PORT=8000"
 if not "%~1"=="" set "PORT=%~1"
 
-set "DB_PATH=%CD%\backend\data\catalog.db"
+set "DB_PATH=%CD%\catalog.db"
 set "ENV_PATH=%CD%\backend\.env"
 
 echo VoiceShop++ backend
@@ -18,9 +18,7 @@ if not exist "%DB_PATH%" (
     echo ERROR: catalog database not found:
     echo   %DB_PATH%
     echo.
-    echo Build or copy the database first, then run this script again.
-    echo Example:
-    echo   python tools\build_laptops.py --input tools\meta_Electronics_part.jsonl.gz --limit 500 --out backend\data\catalog.db
+    echo Place the enriched catalog.db in the project root, then run this script again.
     pause
     exit /b 1
 )
