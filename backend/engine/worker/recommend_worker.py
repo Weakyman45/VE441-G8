@@ -6,34 +6,46 @@ from ..llm.qwen_client import chat_completion, qwen_configured
 from ..models import PreferenceProfile, RankedProduct, RecommendationBundle
 
 
+# 视觉相似度在打分中的最大加权(cosine∈[0,1] → 最多 +VISUAL_WEIGHT)
+_VISUAL_WEIGHT = 30
+
+
 def rank_products(
     plan_id: str,
     profile: PreferenceProfile,
     candidates: list[dict[str, Any]],
     top_n: int = 40,
+    *,
+    modality: str = "text",
+    extra_excluded: list[dict[str, str]] | None = None,
 ) -> RecommendationBundle:
+    """约束感知的重排序(创新点三下半):对已通过校验的候选做软排序,融合
+    视觉相似度 + 关键词相关性 + 质量 + 价格。`modality` 决定视觉主导还是文本主导;
+    `extra_excluded` 为校验器(Verifier)拒绝的候选,并入 excluded 供解释。"""
     query_tokens = _keyword_tokens(profile.search_keywords)
     scored: list[tuple[int, int, dict[str, Any], list[str]]] = []
-    excluded: list[dict[str, str]] = []
+    excluded: list[dict[str, str]] = list(extra_excluded or [])
     for item in candidates:
         score, reasons, exclude_reason = _score(profile, item)
         if exclude_reason:
             excluded.append({"id": str(item.get("id", "")), "reason": exclude_reason})
             continue
         # Relevance = how many specific product words appear in the name. This is
-        # the PRIMARY ranking signal: a genuine match must outrank a merely
-        # high-rated item, otherwise ratings saturate the score cap and cheap
-        # irrelevant products win the tiebreak.
+        # the PRIMARY ranking signal for text/text+image modes.
         name = str(item.get("name") or "").lower()
         relevance = sum(1 for t in query_tokens if t in name)
         scored.append((relevance, score, item, reasons))
-    # Sort by relevance first, then quality score, then price ascending.
-    scored.sort(key=lambda x: (-x[0], -x[1], x[2].get("price") or 10**9))
-    # Show ALL genuinely relevant products (name matched >=1 specific product
-    # word), not just a fixed top-3. Only when nothing matched the keywords do
-    # we fall back to a small set so the screen is not empty.
-    relevant = [t for t in scored if t[0] >= 1]
-    selected = (relevant if relevant else scored[:6])[:top_n]
+
+    if modality == "image":
+        # 纯图片:没有文本相关性可依,直接按分数(已融合视觉相似度)排序。
+        scored.sort(key=lambda x: (-x[1], x[2].get("price") or 10**9))
+        selected = scored[:top_n]
+    else:
+        # 文本 / 图文:关键词相关性优先,其次融合分(含视觉),再价格。
+        scored.sort(key=lambda x: (-x[0], -x[1], x[2].get("price") or 10**9))
+        relevant = [t for t in scored if t[0] >= 1]
+        selected = (relevant if relevant else scored[:6])[:top_n]
+
     ranked = [
         RankedProduct(
             id=str(item.get("id", "")),
@@ -48,6 +60,7 @@ def rank_products(
             performance=str(item.get("performance") or ""),
             weight_kg=float(item.get("weight_kg") or 0),
             image_url=str(item.get("image_url") or ""),
+            visual_score=float(item.get("_visual_score") or 0.0),
         )
         for relevance, score, item, reasons in selected
     ]
@@ -150,6 +163,13 @@ def _score(profile: PreferenceProfile, item: dict[str, Any]) -> tuple[int, list[
         if token in haystack:
             score += 3
             reasons.append(f"Matches image cue: {token}")
+    # 融合视觉相似度(创新点二/三):cosine∈[0,1] → 最多 +_VISUAL_WEIGHT
+    visual = float(item.get("_visual_score") or 0.0)
+    if visual > 0:
+        bonus = int(round(_VISUAL_WEIGHT * visual))
+        if bonus > 0:
+            score += bonus
+            reasons.append(f"Visual similarity {visual:.2f}")
     if "oled" in soft or "display" in soft or "design" in soft or "color" in soft:
         if "OLED" in display.upper():
             score += 3

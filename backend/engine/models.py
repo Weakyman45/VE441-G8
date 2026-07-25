@@ -37,6 +37,7 @@ class RankedProduct:
     performance: str = ""
     weight_kg: float = 0.0
     image_url: str = ""
+    visual_score: float = 0.0   # 与用户上传图的视觉相似度(创新点二/三融合排序用)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

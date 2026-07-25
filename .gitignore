@@ -15,3 +15,18 @@ backend/.env
 # Large raw dataset dumps (re-downloadable via tools/download_all.py) — do not commit
 tools/*.jsonl
 tools/*.jsonl.gz
+
+# Python caches / compiled files
+__pycache__/
+*.pyc
+
+# Runtime logs & DB backups / working copies — do not commit
+backend/data/engine_logs.db
+backend/data/uploads/
+backend/data/*.bak
+backend/data/*catalog*backup*.db
+backend/data/catalog_filtered.db
+backend/data/catalog.db.*
+
+# Ad-hoc local diagnostic scripts
+backend/_test_online.py

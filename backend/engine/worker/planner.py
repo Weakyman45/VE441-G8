@@ -5,19 +5,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..llm.qwen_client import chat_json, qwen_configured
-from ..intent import preference_search_query
 from ..models import SessionState
 
 
 def _fallback_query_hint(pref) -> str:
-    """Best catalog query without an LLM. The catalog is English, so prefer the
-    English search keywords / derived query over the (possibly Chinese) raw text."""
-    if pref.search_keywords:
-        return " ".join(pref.search_keywords)
-    derived = preference_search_query(pref)
-    if derived.strip():
-        return derived.strip()
-    return pref.use_case or ""
+    """无 LLM 时的 query_hint(仅作计划元信息/展示,不再参与检索):直接用 LLM 从
+    用户输入抽出的英文关键词,没有就为空——不补任何规则默认。"""
+    return " ".join(pref.search_keywords)
 
 
 @dataclass

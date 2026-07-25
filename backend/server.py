@@ -219,6 +219,25 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+_ENRICHED_COL: bool | None = None
+
+
+def _enriched_available() -> bool:
+    """catalog.db 是否含富集列 enriched_text(创新点二);检测一次并缓存。"""
+    global _ENRICHED_COL
+    if _ENRICHED_COL is None:
+        try:
+            conn = _connect()
+            try:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(laptops)").fetchall()}
+                _ENRICHED_COL = "enriched_text" in cols
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            _ENRICHED_COL = False
+    return _ENRICHED_COL
+
+
 def search(params: dict) -> list[dict]:
     q = (params.get("q", [""])[0] or "").strip().lower()
     max_price = _to_int(params.get("max_price", [None])[0])
@@ -255,9 +274,17 @@ def search(params: dict) -> list[dict]:
     rel_args: list = []
     order_by = order
     if tokens:
-        clause = " OR ".join(["LOWER(name) LIKE ?"] * len(tokens))
-        where.append(f"({clause})")
-        args.extend([f"%{t}%" for t in tokens])
+        # 创新点二:文本召回除 name 外也命中富集文本 enriched_text(若已富集),
+        # 以扩大召回覆盖细粒度属性;相关性排序仍以 name 命中为主,保持精度不变。
+        match_cols = ["name"]
+        if _enriched_available():
+            match_cols.append("enriched_text")
+        per_tok = []
+        for _t in tokens:
+            ors = " OR ".join([f"LOWER(COALESCE({c},'')) LIKE ?" for c in match_cols])
+            per_tok.append(f"({ors})")
+            args.extend([f"%{_t}%"] * len(match_cols))
+        where.append("(" + " OR ".join(per_tok) + ")")
         rel_expr = " + ".join(["(LOWER(name) LIKE ?)"] * len(tokens))
         rel_args = [f"%{t}%" for t in tokens]
         order_by = f"({rel_expr}) DESC, {order}"
@@ -591,9 +618,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not sid:
                     self._send(400, {"error": "missing_session_id"})
                     return
+                # 纯图片检索:文字可为空,只要 session 已上传图片即可继续
                 if len(text) < 2:
-                    self._send(400, {"error": "empty_text"})
-                    return
+                    _state = SESSION_STORE.create_or_get(sid)
+                    if not _session_image_data_urls(_state):
+                        self._send(400, {"error": "empty_text"})
+                        return
                 self._stream_analyze(sid, text)
             elif path.startswith("/api/v1/session/") and path.endswith("/text"):
                 sid = path[len("/api/v1/session/"):-len("/text")].strip("/")
@@ -602,11 +632,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not sid:
                     self._send(400, {"error": "missing_session_id"})
                     return
-                if len(text) < 2:
-                    self._send(400, {"error": "empty_text"})
-                    return
 
                 state = SESSION_STORE.create_or_get(sid)
+                # 纯图片检索:文字可为空,只要 session 已上传图片即可继续
+                if len(text) < 2 and not _session_image_data_urls(state):
+                    self._send(400, {"error": "empty_text"})
+                    return
                 combined_text = text
                 if state.preference.visual_context:
                     combined_text = (

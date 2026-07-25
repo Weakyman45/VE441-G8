@@ -80,29 +80,6 @@ def extract_preference(text: str, prior: PreferenceProfile | None = None) -> Pre
     return profile
 
 
-def preference_search_query(profile: PreferenceProfile) -> str:
-    parts: list[str] = []
-    # English keywords from the LLM brief come first — the catalog is English,
-    # so these are the terms most likely to actually match product names.
-    if profile.search_keywords:
-        parts.extend(profile.search_keywords)
-    # An ASCII/English category still helps; a Chinese one is dropped by the
-    # search tokenizer anyway, so only append when it looks English.
-    if profile.category and profile.category.isascii():
-        parts.append(profile.category if profile.category != "phone" else "phone")
-    if profile.platform in ("Windows", "macOS"):
-        parts.append("macbook" if profile.platform == "macOS" else "windows")
-    soft_bits = " ".join(profile.soft + profile.hard)
-    if profile.visual_context:
-        parts.append(profile.visual_context)
-    for token in ("oled", "gaming", "touch", "portable"):
-        if token in soft_bits.lower():
-            parts.append(token)
-    if profile.raw_query:
-        parts.append(profile.raw_query)
-    return " ".join(parts).strip()
-
-
 def _upsert(values: list[str], label: str) -> None:
     key = label.split(":")[0].split(" up to")[0].lower()
     for i, existing in enumerate(values):

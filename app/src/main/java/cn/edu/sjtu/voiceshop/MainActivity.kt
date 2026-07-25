@@ -90,7 +90,8 @@ class MainActivity : Activity() {
         val tradeOffs: List<String>,
         val color: Int,
         val platform: String = "Windows",
-        val imageUrl: String = ""
+        val imageUrl: String = "",
+        val visualScore: Double = 0.0
     )
 
     private val ink = Color.rgb(30, 39, 50)
@@ -201,6 +202,7 @@ class MainActivity : Activity() {
                 if (isDestroyed) return@post
                 if (loaded.isNotEmpty()) {
                     laptops = loaded
+                    resultsFromWorker = false
                     catalogSource = "Backend: ${loaded.size} products (q=\"$query\")"
                     Log.i("VoiceShop", catalogSource)
                 } else {
@@ -306,7 +308,12 @@ class MainActivity : Activity() {
     private var pendingConstraint = ""
     private val selectedIds = linkedSetOf<String>()
     private var sortMode = SortMode.MATCH
-    private var filterUnderBudget = true
+    // 预算过滤默认关闭:通用品类(鞋/咖啡…)价格量级差异大,只有当用户/大模型
+    // 明确给出预算(hasKnownBudget())时,勾选才有意义。
+    private var filterUnderBudget = false
+    // 当前展示的商品是否来自 Worker 多智能体流水线(视觉召回 + 校验 + 融合排序)。
+    // 为 true 时,MATCH 排序直接沿用后端排序,避免客户端启发式把后端结果打乱。
+    private var resultsFromWorker = false
     private var filterOled = false
     private var filterPortable = false
     private var filterTopRated = false
@@ -461,7 +468,7 @@ class MainActivity : Activity() {
         pendingConstraint = state.getString("pendingConstraint", "")
         state.getStringArrayList("selected")?.let { selectedIds.apply { clear(); addAll(it) } }
         sortMode = runCatching { SortMode.valueOf(state.getString("sort") ?: "MATCH") }.getOrDefault(SortMode.MATCH)
-        filterUnderBudget = state.getBoolean("budget", true)
+        filterUnderBudget = state.getBoolean("budget", false)
         filterOled = state.getBoolean("oled", false)
         filterPortable = state.getBoolean("portable", false)
         filterTopRated = state.getBoolean("topRated", false)
@@ -765,7 +772,7 @@ class MainActivity : Activity() {
             primary = true,
             enabled = imageReady
         ) {
-            if (mustHaves.isEmpty()) toast("Add at least one must-have before searching.") else {
+            if (mustHaves.isEmpty() && selectedImageUri == null) toast("Add at least one must-have (or a reference image) before searching.") else {
                 analysisProgress = 0
                 analysisPaused = false
                 setStage(Stage.REFINE)
@@ -1009,7 +1016,8 @@ class MainActivity : Activity() {
         ), fullWidth(bottom = dp(4)))
         addView(text(
             if (shoppingNeed.isBlank()) "Popular options for you"
-            else "${money(budgetLimit())} budget • ${mustHaves.size + preferences.size} active preferences",
+            else (if (hasKnownBudget()) "${money(budgetLimit())} budget • " else "") +
+                "${mustHaves.size + preferences.size} active preferences",
             13f,
             muted
         ), fullWidth(bottom = dp(12)))
@@ -1058,12 +1066,15 @@ class MainActivity : Activity() {
 
     private fun filterControls(): View = card(surface).apply {
         addView(text("Filters", 13f, ink, Typeface.BOLD), fullWidth(bottom = dp(4)))
-        addView(CheckBox(this@MainActivity).apply {
-            text = "Under ${money(budgetLimit())}"
-            setTextColor(ink)
-            isChecked = filterUnderBudget
-            setOnCheckedChangeListener { _, value -> filterUnderBudget = value; render() }
-        })
+        // 预算过滤只有在确有预算时才展示,否则默认 ¥7000 会误导用户。
+        if (hasKnownBudget()) {
+            addView(CheckBox(this@MainActivity).apply {
+                text = "Under ${money(budgetLimit())}"
+                setTextColor(ink)
+                isChecked = filterUnderBudget
+                setOnCheckedChangeListener { _, value -> filterUnderBudget = value; render() }
+            })
+        }
         // OLED / weight are laptop-specific — only offer them for computers.
         if (isComputerCategory()) {
             addView(CheckBox(this@MainActivity).apply {
@@ -1109,19 +1120,31 @@ class MainActivity : Activity() {
 
     private fun filteredLaptops(): List<Laptop> {
         val computer = isComputerCategory()
+        val budgetKnown = hasKnownBudget()
         val filtered = laptops.filter { laptop ->
-            (!filterUnderBudget || laptop.price <= budgetLimit()) &&
+            // 只有在用户确实给了预算时,预算过滤才生效(不再用 ¥7000 硬卡通用品类)。
+            (!filterUnderBudget || !budgetKnown || laptop.price <= budgetLimit()) &&
                 (!filterTopRated || laptop.rating >= 4.5) &&
                 (!(computer && filterOled) || laptop.display.contains("OLED")) &&
                 (!(computer && filterPortable) || laptop.weightKg < 1.5) &&
                 (!computer || osPreference == "No preference" || laptop.platform == osPreference)
         }
         return when (sortMode) {
-            SortMode.MATCH -> filtered.sortedByDescending { matchScore(it) }
+            // Worker 结果已由后端(视觉召回 + 约束校验 + 融合排序)排好序,MATCH 直接
+            // 沿用后端顺序,不再用客户端启发式重排,确保新算法的排序真正生效。
+            SortMode.MATCH -> if (resultsFromWorker) filtered
+                              else filtered.sortedByDescending { matchScore(it) }
             SortMode.PRICE -> filtered.sortedBy { it.price }
             SortMode.RATING -> filtered.sortedByDescending { it.rating }
         }
     }
+
+    // 是否已确定一个真实预算(来自 must-haves 里的数字、大模型抽取的 budget、或
+    // 需求文本里的数字),而不是回退默认值。决定是否启用预算过滤 / 显示预算文案。
+    private fun hasKnownBudget(): Boolean =
+        budgetsIn(mustHaves.joinToString(" ")).isNotEmpty() ||
+            analyzedBudget != null ||
+            budgetsIn(shoppingNeed).isNotEmpty()
 
     private fun budgetLimit(): Int {
         // 1) A number written in the must-haves is authoritative (user-editable).
@@ -1181,8 +1204,10 @@ class MainActivity : Activity() {
             .joinToString(" ")
             .lowercase(Locale.getDefault())
         var score = product.match
-        val budget = budgetLimit()
-        score += if (product.price <= budget) 1 else -((product.price - budget) / 100).coerceIn(2, 15)
+        if (hasKnownBudget()) {
+            val budget = budgetLimit()
+            score += if (product.price <= budget) 1 else -((product.price - budget) / 100).coerceIn(2, 15)
+        }
         if (listOf("display", "design", "color", "oled").any(context::contains)) {
             score += if (product.display.contains("OLED")) 2 else 0
         }
@@ -1240,12 +1265,17 @@ class MainActivity : Activity() {
     }
 
     private fun matchReasons(product: Laptop): List<String> {
-        val budgetReason = if (product.price <= budgetLimit()) {
-            "Within your confirmed ${money(budgetLimit())} budget"
-        } else {
-            "${money(product.price - budgetLimit())} above the confirmed budget"
+        // 预算相关文案只在确有预算时显示,避免出现"¥X above the confirmed budget"
+        // 这种基于默认 ¥7000 的误导性理由。
+        val budgetReason = when {
+            !hasKnownBudget() -> null
+            product.price <= budgetLimit() -> "Within your confirmed ${money(budgetLimit())} budget"
+            else -> "${money(product.price - budgetLimit())} above the confirmed budget"
         }
-        return listOf(budgetReason) + product.reasons.filterNot {
+        // 展示后端视觉召回给出的图片相似度,让"图片检索"这一创新点在前端可见。
+        val visualReason = if (product.visualScore > 0.0)
+            "Visual match ${(product.visualScore * 100).toInt()}%" else null
+        return listOfNotNull(visualReason, budgetReason) + product.reasons.filterNot {
             it.contains("budget", ignoreCase = true) || it.contains("below", ignoreCase = true) || it.contains("price", ignoreCase = true)
         }
     }
@@ -1609,8 +1639,16 @@ class MainActivity : Activity() {
     }
 
     private fun submitNeed() {
-        if (shoppingNeed.trim().length < 2) {
-            toast("请描述你的购物需求，或使用语音/示例任务。")
+        val hasText = shoppingNeed.trim().length >= 2
+        val hasImage = selectedImageUri != null
+        // 允许"纯图片"检索:有文字或有图片即可提交。
+        if (!hasText && !hasImage) {
+            toast("请描述你的购物需求,或添加一张参考图片。")
+            return
+        }
+        // 纯图片时必须等图片上传完成,后端才能做以图搜图的视觉召回。
+        if (!hasText && hasImage && (imageUploadInFlight || uploadedImageId == null)) {
+            toast("图片上传中,请稍候…")
             return
         }
         shoppingNeed = shoppingNeed.trim()
@@ -1621,7 +1659,8 @@ class MainActivity : Activity() {
         preferences.clear()
         productCategory = ""
         deriveAssumptionsFromNeed()
-        loadCatalogAsync(buildSearchQuery())
+        // 纯图片时检索关键词可能为空:此时跳过关键词直搜,交给 Worker 的视觉召回。
+        buildSearchQuery().takeIf { it.isNotBlank() }?.let { loadCatalogAsync(it) }
         startBriefAnalysis(restart = true)
         setStage(Stage.CONTEXT)
     }
@@ -2173,13 +2212,15 @@ class MainActivity : Activity() {
                     tradeOffs = listOf("Confirm specs before purchase"),
                     color = catalogColors[i % catalogColors.size],
                     platform = item.optString("platform").ifBlank { "Windows" },
-                    imageUrl = item.optString("image_url").trim()
+                    imageUrl = item.optString("image_url").trim(),
+                    visualScore = item.optDouble("visual_score", 0.0)
                 )
             )
         }
         if (mapped.isEmpty()) return
         lastWorkerPlanId = planId
         laptops = mapped
+        resultsFromWorker = true
         catalogSource = "Worker: ${mapped.size} ranked (plan=$planId)"
         val summary = bundle.optString("summary")
         if (summary.isNotBlank()) toast(summary)
@@ -2414,7 +2455,7 @@ class MainActivity : Activity() {
                 pendingConstraint = ""
                 selectedIds.clear()
                 sortMode = SortMode.MATCH
-                filterUnderBudget = true
+                filterUnderBudget = false
                 filterOled = false
                 filterPortable = false
                 detailProductId = "nova"

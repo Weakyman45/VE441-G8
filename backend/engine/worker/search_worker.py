@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from ..intent import preference_search_query
 from ..models import PreferenceProfile
 
 
@@ -13,14 +12,13 @@ def run_search(
     profile: PreferenceProfile,
     search_fn: SearchFn,
     limit: int = 80,
-    query_hint: str | None = None,
 ) -> list[dict[str, Any]]:
-    # Prefer the analysis' English catalog keywords — they are the richest and
-    # tuned to the (English) catalog. The planner's rephrased query_hint often
-    # narrows or drifts (e.g. "espresso" only, missing "coffee maker"), so it is
-    # only a fallback. preference_search_query is the last resort.
-    keyword_q = " ".join(profile.search_keywords).strip()
-    q = keyword_q or (query_hint or "").strip() or preference_search_query(profile)
+    # 文本检索只由**用户输入**驱动:LLM 从用户文字(+图片)抽出的英文目录关键词
+    # search_keywords。不再回退到 planner 的 query_hint,也不补任何规则默认值——
+    # 用户没给可检索的文字信息,查询就为空,关键词召回直接返回空(交给图片召回)。
+    q = " ".join(profile.search_keywords).strip()
+    if not q:
+        return []
     params: dict[str, list] = {"q": [q], "limit": [str(limit)], "sort": ["popular"]}
     if profile.budget:
         # Catalog prices are USD-ish; App shows ¥ — keep numeric filter soft.
