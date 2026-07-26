@@ -12,7 +12,8 @@
 
 2) 在线(查询期,零 VL):
    - 把用户上传图算成向量,与库中商品向量做余弦 → 视觉召回 top-K;
-   - 读取 `enriched_text` 供关键词召回、`visual_attrs` 供校验器判 must-have。
+   - 读取 `enriched_text` 供关键词召回、`visual_attrs` 供校验器判 must-have;
+   - 查询句 → `text_embedding` 余弦 → 文本语义召回(与关键词并集)。
 
 依赖:仅标准库(纯 Python 余弦,无 numpy)。图像/文本向量与视觉属性统一只走
    DashScope(multimodal-embedding-v1 / qwen-vl-plus,同一把 DASHSCOPE_API_KEY):
@@ -28,6 +29,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import struct
 import time
@@ -45,6 +47,7 @@ ENRICH_COLUMNS = {
     "image_embedding": "TEXT",   # base64(float32[]) —— 商品图向量
     "visual_attrs": "TEXT",      # JSON —— 分层属性 {visual:{}, physical:{}, textual:{}}
     "enriched_text": "TEXT",     # 可被关键词命中的富集检索文本
+    "text_embedding": "TEXT",    # base64(float32[]) —— 商品文本语义向量
 }
 
 _HASH_DIM = 64  # hash 兜底向量维度
@@ -140,6 +143,33 @@ def _hash_embed(seed: str) -> list[float]:
             vec.append(val - 0.5)
         i += 1
     return vec
+
+
+_HASH_STOP = {
+    "the", "a", "an", "for", "and", "or", "of", "to", "in", "on", "with", "by",
+    "from", "is", "are", "this", "that", "it", "as", "at", "be", "size", "pack",
+    "fl", "oz", "ml", "cm", "mm", "inch", "inches", "set", "new", "free",
+}
+
+
+def _hash_text_bow(text: str) -> list[float]:
+    """离线文本伪语义:词袋多哈希投影 + L2 归一化。共享词越多余弦越高。"""
+    tokens = [
+        t
+        for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(t) >= 3 and t not in _HASH_STOP
+    ]
+    if not tokens:
+        return _hash_embed(f"text:{(text or '').strip()}")
+    vec = [0.0] * _HASH_DIM
+    for t in tokens:
+        for k in range(4):
+            h = hashlib.sha256(f"{t}#{k}".encode("utf-8")).digest()
+            idx = struct.unpack("<I", h[:4])[0] % _HASH_DIM
+            sign = 1.0 if (h[4] & 1) else -1.0
+            vec[idx] += sign
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return [x / norm for x in vec]
 
 
 def embed_image_url(url: str, provider: str | None = None) -> list[float]:
@@ -340,6 +370,44 @@ def has_enrichment(db_path: str = DEFAULT_DB) -> bool:
             pass
 
 
+def has_text_embeddings(db_path: str = DEFAULT_DB) -> bool:
+    """库里是否已有商品文本语义向量(在线文本语义召回判据)。"""
+    if not os.path.exists(db_path):
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(laptops)").fetchall()}
+        if "text_embedding" not in cols:
+            return False
+        n = conn.execute(
+            "SELECT COUNT(*) FROM laptops "
+            "WHERE text_embedding IS NOT NULL AND text_embedding<>''"
+        ).fetchone()[0]
+        return int(n) > 0
+    except sqlite3.Error:
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def product_text_for_embed(row: dict) -> str:
+    """拼商品可嵌入文本:enriched_text 优先,否则 name + summary。"""
+    enriched = str(row.get("enriched_text") or "").strip()
+    if enriched:
+        return enriched[:2000]
+    parts = [
+        str(row.get("name") or "").strip(),
+        str(row.get("summary") or "").strip(),
+        str(row.get("category") or "").strip(),
+    ]
+    return "; ".join(p for p in parts if p)[:2000]
+
+
 def fetch_products_by_ids(db_path: str, ids: Iterable[str]) -> list[dict]:
     ids = [i for i in ids if i]
     if not ids:
@@ -469,10 +537,289 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
     prov = provider or CONFIG.embedding_provider
     clean = (text or "").strip()
     if prov == "hash":
-        return _hash_embed(f"text:{clean}")
+        return _hash_text_bow(clean)
     if not clean:
         return []
     return _dashscope_multimodal_embed({"text": clean[:2000]}) or []
+
+
+# --------------------------------------------------------------------------- #
+# 在线:文本语义索引 + 召回
+# --------------------------------------------------------------------------- #
+class TextIndex:
+    """商品 text_embedding 内存索引,查询期余弦 top-K。"""
+
+    def __init__(self, db_path: str = DEFAULT_DB) -> None:
+        self.db_path = db_path
+        self._ids: list[str] = []
+        self._vecs: list[list[float]] = []
+        self._cats: list[str] = []
+        self._loaded = False
+
+    def load(self) -> "TextIndex":
+        if self._loaded:
+            return self
+        if os.path.exists(self.db_path):
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(laptops)").fetchall()}
+                if "text_embedding" in cols:
+                    has_attrs = "visual_attrs" in cols
+                    has_cat_col = "category" in cols
+                    fields = ["id", "text_embedding"]
+                    if has_attrs:
+                        fields.append("visual_attrs")
+                    if has_cat_col:
+                        fields.append("category")
+                    q = (
+                        f"SELECT {', '.join(fields)} FROM laptops "
+                        "WHERE text_embedding IS NOT NULL AND text_embedding<>''"
+                    )
+                    for r in conn.execute(q):
+                        vec = decode_vec(r[1])
+                        if not vec:
+                            continue
+                        self._ids.append(str(r[0]))
+                        self._vecs.append(vec)
+                        cat = ""
+                        idx = 2
+                        if has_attrs:
+                            raw_attrs = r[idx] if len(r) > idx else None
+                            idx += 1
+                            if raw_attrs:
+                                try:
+                                    attrs = (
+                                        json.loads(raw_attrs)
+                                        if isinstance(raw_attrs, str)
+                                        else {}
+                                    )
+                                    cat = str(
+                                        (attrs.get("visual") or {}).get("product_category")
+                                        or (attrs.get("textual") or {}).get("category")
+                                        or ""
+                                    )
+                                except (json.JSONDecodeError, AttributeError, TypeError):
+                                    cat = ""
+                        if has_cat_col and not cat:
+                            cat = str(r[idx] or "") if len(r) > idx else ""
+                        self._cats.append(cat.lower())
+            except sqlite3.Error:
+                pass
+            finally:
+                conn.close()
+        # 丢弃少数异维向量(换 provider 半截跑时可能混入)
+        if self._vecs:
+            from collections import Counter
+            dim_counts = Counter(len(v) for v in self._vecs)
+            keep_dim = dim_counts.most_common(1)[0][0]
+            if len(dim_counts) > 1:
+                kept_ids, kept_vecs, kept_cats = [], [], []
+                for i, v in enumerate(self._vecs):
+                    if len(v) == keep_dim:
+                        kept_ids.append(self._ids[i])
+                        kept_vecs.append(v)
+                        kept_cats.append(self._cats[i])
+                self._ids, self._vecs, self._cats = kept_ids, kept_vecs, kept_cats
+        self._loaded = True
+        return self
+
+    @property
+    def size(self) -> int:
+        return len(self._ids)
+
+    def search(
+        self,
+        query_vec: list[float],
+        top_k: int = 40,
+        category: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if not query_vec or not self._ids:
+            return []
+        cat = (category or "").strip().lower()
+        scored: list[tuple[str, float]] = []
+        for i, vec in enumerate(self._vecs):
+            if cat and self._cats[i] and cat not in self._cats[i] and self._cats[i] not in cat:
+                continue
+            scored.append((self._ids[i], cosine(query_vec, vec)))
+        scored.sort(key=lambda x: -x[1])
+        return scored[:top_k]
+
+
+_TEXT_INDEX_CACHE: dict[str, TextIndex] = {}
+
+
+def get_text_index(db_path: str = DEFAULT_DB) -> TextIndex:
+    idx = _TEXT_INDEX_CACHE.get(db_path)
+    if idx is None:
+        idx = TextIndex(db_path).load()
+        _TEXT_INDEX_CACHE[db_path] = idx
+    return idx
+
+
+def _provider_for_index(idx: "TextIndex", provider: str | None) -> str | None:
+    """查询向量必须与库内向量同空间。索引是 hash(64 维)时强制走 hash。"""
+    if idx.size == 0:
+        return provider
+    dim = len(idx._vecs[0])  # noqa: SLF001
+    if dim == _HASH_DIM:
+        return "hash"
+    return provider
+
+
+def text_semantic_recall(
+    query: str,
+    *,
+    db_path: str = DEFAULT_DB,
+    top_k: int | None = None,
+    category: str | None = None,
+    provider: str | None = None,
+) -> list[dict]:
+    """在线文本语义召回:查询句 → 向量 → 余弦 top-K(带 `_text_score`)。"""
+    idx = get_text_index(db_path)
+    if idx.size == 0:
+        return []
+    q = (query or "").strip()
+    if not q:
+        return []
+    qvec = embed_text(q, provider=_provider_for_index(idx, provider))
+    if not qvec:
+        return []
+    k = top_k if top_k is not None else int(getattr(CONFIG, "text_top_k", 40) or 40)
+    hits = idx.search(qvec, top_k=k, category=category)
+    if not hits:
+        return []
+    id_order = [h[0] for h in hits]
+    score_map = {h[0]: h[1] for h in hits}
+    products = fetch_products_by_ids(db_path, id_order)
+    for p in products:
+        p["_text_score"] = round(float(score_map.get(str(p.get("id")), 0.0)), 4)
+        p["_recall_source"] = "text_semantic"
+    return products
+
+
+def attach_text_scores(
+    candidates: list[dict],
+    query: str,
+    *,
+    db_path: str = DEFAULT_DB,
+    provider: str | None = None,
+) -> list[dict]:
+    """给候选补上 `_text_score`(与库内 text_embedding 的余弦)。"""
+    if not candidates or not (query or "").strip() or not has_text_embeddings(db_path):
+        return candidates
+    idx = get_text_index(db_path)
+    if idx.size == 0:
+        return candidates
+    qvec = embed_text(query, provider=_provider_for_index(idx, provider))
+    if not qvec:
+        return candidates
+    id_to_i = {pid: i for i, pid in enumerate(idx._ids)}  # noqa: SLF001
+    for p in candidates:
+        pid = str(p.get("id") or "")
+        i = id_to_i.get(pid)
+        if i is None:
+            p.setdefault("_text_score", 0.0)
+            continue
+        p["_text_score"] = round(cosine(qvec, idx._vecs[i]), 4)  # noqa: SLF001
+    return candidates
+
+
+def enrich_text_embeddings(
+    db_path: str = DEFAULT_DB,
+    *,
+    limit: int | None = None,
+    provider: str | None = None,
+    only_missing: bool = True,
+    verbose: bool = True,
+    sleep_s: float = 0.0,
+    workers: int = 1,
+) -> dict:
+    """离线为商品写入 text_embedding(可独立于图像富集运行)。
+
+    workers>1 时对 DashScope 做线程池并发(hash 本地很快,并发无意义)。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    prov = provider or CONFIG.embedding_provider
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    ensure_columns(conn)
+    where = "WHERE (name IS NOT NULL AND name<>'')"
+    if only_missing:
+        where += " AND (text_embedding IS NULL OR text_embedding='')"
+    sql = f"SELECT * FROM laptops {where}"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    rows = [_row_to_dict(r) for r in conn.execute(sql).fetchall()]
+    conn.close()
+
+    n_workers = max(1, int(workers or 1))
+    if prov == "hash":
+        n_workers = 1
+
+    def _one(row: dict) -> tuple[str, str, str, list[float]]:
+        text = product_text_for_embed(row)
+        vec = embed_text(text, provider=prov) if text else []
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+        return str(row["id"]), text, str(row.get("enriched_text") or ""), vec
+
+    done = 0
+    ok = 0
+    conn = sqlite3.connect(db_path)
+    try:
+        if n_workers == 1:
+            results_iter = (_one(r) for r in rows)
+            pending = results_iter
+            for pid, text, enriched, vec in pending:
+                if vec:
+                    conn.execute(
+                        "UPDATE laptops SET text_embedding=? WHERE id=?",
+                        (encode_vec(vec), pid),
+                    )
+                    if not enriched.strip() and text:
+                        conn.execute(
+                            "UPDATE laptops SET enriched_text=? WHERE id=?",
+                            (text[:600], pid),
+                        )
+                    ok += 1
+                done += 1
+                if verbose and done % 50 == 0:
+                    print(f"  ... text-embed {done}/{len(rows)} (ok {ok})")
+                    conn.commit()
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futs = {pool.submit(_one, r): r for r in rows}
+                for fut in as_completed(futs):
+                    pid, text, enriched, vec = fut.result()
+                    if vec:
+                        conn.execute(
+                            "UPDATE laptops SET text_embedding=? WHERE id=?",
+                            (encode_vec(vec), pid),
+                        )
+                        if not enriched.strip() and text:
+                            conn.execute(
+                                "UPDATE laptops SET enriched_text=? WHERE id=?",
+                                (text[:600], pid),
+                            )
+                        ok += 1
+                    done += 1
+                    if verbose and done % 50 == 0:
+                        print(f"  ... text-embed {done}/{len(rows)} (ok {ok})")
+                        conn.commit()
+        conn.commit()
+    finally:
+        conn.close()
+    _TEXT_INDEX_CACHE.pop(db_path, None)
+    stats = {
+        "processed": done,
+        "text_embeddings": ok,
+        "provider": prov,
+        "workers": n_workers,
+    }
+    if verbose:
+        print(f"Text embed done. {stats}")
+    return stats
 
 
 def attach_visual_scores(candidates: list[dict], image_bytes: bytes, *,
@@ -542,10 +889,33 @@ def enrich_catalog(db_path: str = DEFAULT_DB, *, limit: int | None = None,
         enriched = build_enriched_text(row, visual, physical)
         # 空值不覆盖:向量拿到才写 image_embedding,否则保留旧值(避免限流失败冲掉数据)。
         # visual_attrs / enriched_text 由 metadata + 本次 visual 合成,始终写(至少含物理/文字属性)。
-        if vec:
+        text_vec = embed_text(enriched or product_text_for_embed(row), provider=prov)
+        if vec and text_vec:
+            conn.execute(
+                "UPDATE laptops SET image_embedding=?, visual_attrs=?, enriched_text=?, "
+                "text_embedding=? WHERE id=?",
+                (
+                    encode_vec(vec),
+                    json.dumps(attrs, ensure_ascii=False),
+                    enriched,
+                    encode_vec(text_vec),
+                    row["id"],
+                ),
+            )
+        elif vec:
             conn.execute(
                 "UPDATE laptops SET image_embedding=?, visual_attrs=?, enriched_text=? WHERE id=?",
                 (encode_vec(vec), json.dumps(attrs, ensure_ascii=False), enriched, row["id"]),
+            )
+        elif text_vec:
+            conn.execute(
+                "UPDATE laptops SET visual_attrs=?, enriched_text=?, text_embedding=? WHERE id=?",
+                (
+                    json.dumps(attrs, ensure_ascii=False),
+                    enriched,
+                    encode_vec(text_vec),
+                    row["id"],
+                ),
             )
         else:
             conn.execute(
@@ -559,6 +929,7 @@ def enrich_catalog(db_path: str = DEFAULT_DB, *, limit: int | None = None,
     conn.commit()
     conn.close()
     _INDEX_CACHE.pop(db_path, None)  # 使缓存失效
+    _TEXT_INDEX_CACHE.pop(db_path, None)
     stats = {"processed": done, "embeddings": emb_ok, "vl_attrs": vl_ok, "provider": prov}
     if verbose:
         print(f"Done. {stats}")
@@ -575,9 +946,54 @@ def _main() -> None:
     ap.add_argument("--provider", default=None, choices=["dashscope", "hash"],
                     help="向量来源;默认 dashscope。hash 仅供离线测试")
     ap.add_argument("--all", action="store_true", help="重算全部(默认只补缺失)")
+    ap.add_argument(
+        "--text-only",
+        action="store_true",
+        help="只补 text_embedding(不跑图像/VL,适合语义检索建库)",
+    )
+    ap.add_argument(
+        "--sleep",
+        type=float,
+        default=0.0,
+        help="每条文本 embedding 后休眠秒数(限流时用)",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="文本 embedding 并发线程数(DashScope 建议 4~8)",
+    )
+    ap.add_argument(
+        "--clear-text",
+        action="store_true",
+        help="清空全部 text_embedding 后再写(换 provider 时用)",
+    )
     args = ap.parse_args()
-    enrich_catalog(args.db, limit=args.limit, with_vl=args.with_vl,
-                   provider=args.provider, only_missing=not args.all)
+    if args.clear_text:
+        conn = sqlite3.connect(args.db)
+        ensure_columns(conn)
+        conn.execute("UPDATE laptops SET text_embedding=NULL")
+        conn.commit()
+        conn.close()
+        _TEXT_INDEX_CACHE.pop(args.db, None)
+        print("Cleared text_embedding column.")
+    if args.text_only:
+        enrich_text_embeddings(
+            args.db,
+            limit=args.limit,
+            provider=args.provider,
+            only_missing=not args.all,
+            sleep_s=max(0.0, float(args.sleep or 0.0)),
+            workers=max(1, int(args.workers or 1)),
+        )
+    else:
+        enrich_catalog(
+            args.db,
+            limit=args.limit,
+            with_vl=args.with_vl,
+            provider=args.provider,
+            only_missing=not args.all,
+        )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ def cfg(**kw):
         visual_recall=True,
         enrichment=True,
         source_layering=True,
+        text_semantic=True,
         verifier="llm",
         reviews=True,
         intent_shortcircuit=True,
@@ -23,6 +24,7 @@ def cfg(**kw):
         memory=True,
         max_replans=2,
         visual_top_k=40,
+        text_top_k=40,
         review_top_k=20,
         embedding_provider="hash",
     )

@@ -1,0 +1,163 @@
+\subsection{Text \& Image Retrieval}
+\label{sec:innov-retrieval}
+
+The second innovation is a retrieval stage that draws on \emph{both} the enriched
+text and the (text / image) vectors of Section~\ref{sec:innov-offline}, and that is
+composed adaptively according to what the user actually provided. Two workers ---
+Text Retrieval and Visual Retrieval --- run in parallel under a single Recall
+agent; within Text Retrieval, a \emph{keyword} channel and a \emph{text-semantic}
+channel are fused first, after which the text and visual channels are fused by
+Reciprocal Rank Fusion (RRF).
+
+\subsubsection{Text retrieval}
+\label{sec:text}
+
+The user request is first turned into a preference profile by an upstream
+analysis LLM, whose English \emph{search keywords} $K_q$ are the primary query
+signal. The Text Retrieval worker forms a query string from $K_q$ (falling back
+to a planner hint or a preference-derived string when $K_q$ is empty), applies a
+budget-based price ceiling and a platform post-filter, and runs two
+complementary channels whose ranked lists are later RRF-merged.
+
+\paragraph{Keyword channel.}
+The query is tokenized into a content token set $Q$ (length $\geq 3$, stop-words
+removed, de-duplicated, capped). A product is recalled if any token matches its
+product name or enriched text:
+\begin{equation}
+  \mathrm{recall}(p_i)=\bigvee_{k\in Q}
+  \big(k \sqsubseteq \mathrm{name}(p_i)\ \lor\ k \sqsubseteq t_i\big),
+  \label{eq:text-recall}
+\end{equation}
+where $\sqsubseteq$ denotes substring containment. Matching against $t_i$ is the
+payoff of the enrichment layer: fine-grained visual and experiential terms become
+searchable even though they are absent from the product name. Candidates are then
+ranked by a name-plus-enriched relevance score
+\begin{equation}
+  \mathrm{rel}(p_i)=\sum_{k\in Q}\Big(
+    \mathbb{1}\!\left[k\sqsubseteq\mathrm{name}(p_i)\right]
+    +\mathbb{1}\!\left[k\sqsubseteq t_i\right]
+  \Big),
+  \label{eq:rel}
+\end{equation}
+with ties broken by popularity, rating or price. Category is intentionally
+\emph{not} a hard filter here: recall stays high and category precision is
+delegated to the Reject/Verify agent (Section~\ref{sec:innov-reject}).
+
+\paragraph{Text-semantic channel.}
+In parallel, the same worker embeds the query string with the shared multimodal
+encoder $\phi$ of Section~\ref{sec:innov-offline} (DashScope
+\texttt{multimodal-embedding-v1} by default; overridable via
+\texttt{QWEN\_MM\_EMBED\_MODEL}) and retrieves by cosine similarity against
+offline product text vectors $\mathbf{u}_i$ stored in
+\texttt{text\_embedding}. Each product contributes \emph{one} vector: the embed
+text is $t_i$ when present, otherwise a concatenation of name, summary and
+category, truncated to $L{=}2000$ characters --- there is no multi-chunk
+splitting. The channel returns
+\begin{equation}
+  s^{\mathrm{txt}}_i=\cos\!\big(\phi(q),\,\mathbf{u}_i\big),
+  \qquad
+  \mathrm{TextSemRecall}(q)=\operatorname*{top\text{-}K}_{i}\, s^{\mathrm{txt}}_i,
+  \label{eq:stxt}
+\end{equation}
+optionally restricted by a soft category guardrail when a target category is
+known. Each hit is annotated with \texttt{\_text\_score}. The channel is gated by
+\texttt{VS\_TEXT\_SEMANTIC} and activates only when the catalog contains text
+vectors; otherwise Text Retrieval degrades gracefully to the keyword channel
+alone.
+
+\paragraph{Intra-text RRF.}
+Let $L^{\mathrm{kw}}$ and $L^{\mathrm{sem}}$ be the two ranked lists (1-based
+ranks). They are fused by Reciprocal Rank Fusion with constant $k_{\mathrm{rrf}}$
+(default $60$):
+\begin{equation}
+  \mathrm{RRF}(p)=\sum_{\ell\in\{\mathrm{kw},\mathrm{sem}\}}
+  \frac{w_{\ell}}{k_{\mathrm{rrf}}+\mathrm{rank}_{\ell}(p)},
+  \label{eq:rrf-text}
+\end{equation}
+where missing lists contribute nothing and $w_{\ell}$ defaults to $1$. The fused
+list is the Text Retrieval output and carries \texttt{\_rrf\_score}.
+
+\begin{chalgorithm}{Online text retrieval (keyword $\oplus$ semantic)}\label{alg:trecall}
+  \item \textbf{Input:} preference profile (keywords $K_q$, budget, platform),
+        optional query hint; text index $\{(\mathrm{id}_i,\mathbf{u}_i)\}$.
+  \item Build query string $q$ from $K_q$ (else hint / preference fallback).
+  \item $L^{\mathrm{kw}}\gets$ keyword SQL recall on $\mathrm{name}$ / $t_i$
+        (Eq.~\ref{eq:text-recall}--\ref{eq:rel}), with price and platform filters.
+  \item \textbf{if} text-semantic is enabled \textbf{and} the text index is
+        non-empty \textbf{then}
+        $L^{\mathrm{sem}}\gets\operatorname{top\text{-}K}\cos(\phi(q),\mathbf{u}_i)$
+        \textbf{else} $L^{\mathrm{sem}}\gets\varnothing$.
+  \item \textbf{return} $\mathrm{RRF}(L^{\mathrm{kw}},L^{\mathrm{sem}})$
+        (Eq.~\ref{eq:rrf-text}), attaching \texttt{\_text\_score} /
+        \texttt{\_rrf\_score} as available.
+\end{chalgorithm}
+
+\subsubsection{Visual retrieval}
+\label{sec:photo}
+
+The Visual Retrieval worker retrieves products whose image is visually similar
+to a user photo. On first use it loads all stored vectors into an in-memory
+\texttt{VisualIndex} (ids, vectors $\{\mathbf{v}_i\}$, and categories parsed from
+the visual layer); the index is cached across requests and invalidated on
+re-enrichment. Given a user photo $I_q$, every product is scored by cosine
+similarity in the \emph{same} embedding space $\phi$ as text:
+\begin{equation}
+  s^{\mathrm{vis}}_i=\cos\!\big(\phi(I_q),\,\mathbf{v}_i\big),
+  \qquad
+  \cos(\mathbf{a},\mathbf{b})=\frac{\mathbf{a}^{\top}\mathbf{b}}{\lVert\mathbf{a}\rVert\,\lVert\mathbf{b}\rVert},
+  \label{eq:svis}
+\end{equation}
+When a target category $c$ is known --- for example inferred by the VLM from the
+photo in the image-only modality --- a \emph{category guardrail} restricts
+scoring to compatible products, preventing visually-similar but
+categorically-wrong matches:
+\begin{equation}
+  \mathrm{VisualRecall}(I_q)=\operatorname*{top\text{-}K}_{\,i\,:\,\mathrm{cat}_i\sim c}\ s^{\mathrm{vis}}_i .
+  \label{eq:vrecall}
+\end{equation}
+Each returned product is annotated with its \texttt{\_visual\_score}
+(Algorithm~\ref{alg:vrecall}).
+
+\begin{chalgorithm}{Online visual recall}\label{alg:vrecall}
+  \item \textbf{Input:} user photo $I_q$, optional category $c$, index
+        $\{(\mathrm{id}_i,\mathbf{v}_i,\mathrm{cat}_i)\}$.
+  \item \textbf{if} the index is empty \textbf{then return} $\varnothing$.
+  \item $\mathbf{q}\gets\phi(I_q)$.
+  \item $S \gets \{(\mathrm{id}_i,\ \cos(\mathbf{q},\mathbf{v}_i)) : c\text{ unset}\ \lor\ \mathrm{cat}_i\sim c\}$.
+  \item Sort $S$ by score in descending order; \textbf{return} the top-$K$ items,
+        attaching \texttt{\_visual\_score} to each.
+\end{chalgorithm}
+
+\subsubsection{Fusion and modality-adaptive routing}
+\label{sec:fusion}
+
+The Recall agent fuses the Text Retrieval list $L^{\mathrm{txt}}$ and the Visual
+Retrieval list $L^{\mathrm{vis}}$ by a second, modality-weighted RRF,
+\begin{equation}
+  \mathrm{RRF}_{\mathrm{mod}}(p)=
+  \frac{w_{\mathrm{txt}}}{k_{\mathrm{rrf}}+\mathrm{rank}_{\mathrm{txt}}(p)}
+  +\frac{w_{\mathrm{vis}}}{k_{\mathrm{rrf}}+\mathrm{rank}_{\mathrm{vis}}(p)},
+  \label{eq:rrf-mod}
+\end{equation}
+with default weights $(w_{\mathrm{txt}},w_{\mathrm{vis}})$ depending on the
+detected modality (e.g.\ $(1,0)$ for text-only, $(0.55,0.45)$ for text+image,
+$(0.35,0.65)$ for image-only). Products that appear in both lists receive a
+higher RRF score; a channel that is absent or empty contributes nothing. After
+fusion, the agent attaches a visual score and (when a text index exists) a text
+score to \emph{every} surviving candidate --- including those recalled by only
+one channel --- so the downstream Recommend stage sees uniform
+$s^{\mathrm{vis}}$ / $s^{\mathrm{txt}}$ signals and can re-rank primarily by
+\texttt{\_rrf\_score}.
+
+Which channels run is decided per request by a modality router that classifies
+the input as text-only ($T$), text-plus-image ($T{+}I$), or image-only ($I$):
+$T$ runs Text Retrieval only (keyword $\oplus$ text-semantic); $T{+}I$ runs both
+workers and RRF-merges; $I$ first infers a category from the photo and then runs
+category-guarded visual retrieval (optionally still admitting text if the
+router so decides). Every channel is independently switchable through an
+experiment configuration (\texttt{VS\_TEXT\_SEMANTIC}, \texttt{VS\_VISUAL\_RECALL},
+enrichment flags), so the contribution of enrichment, text-semantic recall and
+visual recall can be measured by ablation. Visual retrieval is strictly
+additive: it activates only when a query image is present \emph{and} the catalog
+contains image vectors; text-semantic recall likewise requires stored text
+vectors; otherwise the pipeline proceeds on the remaining active channels.

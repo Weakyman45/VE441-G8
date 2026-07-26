@@ -14,7 +14,12 @@ from engine.conflicts import (  # noqa: E402
     packet_from_reject,
 )
 from engine.models import PreferenceProfile, RankedProduct  # noqa: E402
-from engine.query_fusion import default_fuse_weights, normalize_fuse_weights  # noqa: E402
+from engine.query_fusion import (  # noqa: E402
+    default_fuse_weights,
+    normalize_fuse_weights,
+    rrf_fuse,
+    RRF_K,
+)
 from engine.worker.recommend_worker import rank_products  # noqa: E402
 
 
@@ -62,6 +67,14 @@ class TestFusionWeights(unittest.TestCase):
         self.assertGreater(default_fuse_weights("image")["visual"], 0.5)
         w = normalize_fuse_weights({"text": 2, "visual": 2}, modality="text_image")
         self.assertAlmostEqual(w["text"] + w["visual"], 1.0)
+
+    def test_rrf_prefers_overlap(self):
+        a = [{"id": "1", "name": "a"}, {"id": "2", "name": "b"}]
+        b = [{"id": "2", "name": "b2"}, {"id": "3", "name": "c"}]
+        fused = rrf_fuse([a, b], k=RRF_K)
+        self.assertEqual(fused[0]["id"], "2")  # in both lists
+        self.assertGreater(fused[0]["_rrf_score"], fused[1]["_rrf_score"])
+        self.assertEqual({c["id"] for c in fused}, {"1", "2", "3"})
 
     def test_rank_uses_visual_score(self):
         profile = PreferenceProfile(category="shoes", search_keywords=["running", "shoes"])

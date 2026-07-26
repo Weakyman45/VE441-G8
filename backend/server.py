@@ -395,29 +395,48 @@ def search(params: dict) -> list[dict]:
         "popular": "rating_number DESC",
     }.get(sort, "rating_number DESC")
 
-    # Relevance = how many query tokens appear in the product name. Order by that
-    # FIRST so an item matching several query words (e.g. a real "running shoe")
-    # beats a merely-popular item that happens to share one generic word like
-    # "breathable". Args must be laid out in SQL order: WHERE ... ORDER BY ... LIMIT.
+    # Relevance = how many query tokens appear in name / enriched_text. Order by
+    # that FIRST so an item matching several query words beats a merely-popular
+    # item that shares one generic word. Args: WHERE ... ORDER BY ... LIMIT.
     rel_args: list = []
     order_by = order
-    if tokens:
-        clause = " OR ".join(["LOWER(name) LIKE ?"] * len(tokens))
-        where.append(f"({clause})")
-        args.extend([f"%{t}%" for t in tokens])
-        rel_expr = " + ".join(["(LOWER(name) LIKE ?)"] * len(tokens))
-        rel_args = [f"%{t}%" for t in tokens]
-        order_by = f"({rel_expr}) DESC, {order}"
-
-    sql = "SELECT * FROM laptops"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += f" ORDER BY {order_by} LIMIT ?"
-    args.extend(rel_args)
-    args.append(limit)
-
     conn = _connect()
     try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(laptops)").fetchall()}
+        has_enriched = "enriched_text" in cols
+        if tokens:
+            if has_enriched:
+                clause = " OR ".join(
+                    [
+                        "(LOWER(name) LIKE ? OR LOWER(COALESCE(enriched_text,'')) LIKE ?)"
+                    ]
+                    * len(tokens)
+                )
+                where.append(f"({clause})")
+                for t in tokens:
+                    args.extend([f"%{t}%", f"%{t}%"])
+                rel_expr = " + ".join(
+                    [
+                        "((LOWER(name) LIKE ?) + (LOWER(COALESCE(enriched_text,'')) LIKE ?))"
+                    ]
+                    * len(tokens)
+                )
+                for t in tokens:
+                    rel_args.extend([f"%{t}%", f"%{t}%"])
+            else:
+                clause = " OR ".join(["LOWER(name) LIKE ?"] * len(tokens))
+                where.append(f"({clause})")
+                args.extend([f"%{t}%" for t in tokens])
+                rel_expr = " + ".join(["(LOWER(name) LIKE ?)"] * len(tokens))
+                rel_args = [f"%{t}%" for t in tokens]
+            order_by = f"({rel_expr}) DESC, {order}"
+
+        sql = "SELECT * FROM laptops"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY {order_by} LIMIT ?"
+        args.extend(rel_args)
+        args.append(limit)
         rows = conn.execute(sql, args).fetchall()
         return [_row_to_dict(r) for r in rows]
     finally:

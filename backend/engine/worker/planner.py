@@ -66,15 +66,24 @@ def _rule_intent(utterance: str, session: SessionState) -> str:
         for k in (
             "第二个",
             "第一个",
+            "第三个",
+            "第四个",
+            "第五个",
             "这个",
             "刚才",
+            "刚刚",
             "那个",
             "详情",
             "说说",
             "tell me more",
+            "the first",
             "the second",
+            "the third",
             "this one",
             "that one",
+            "option number",
+            "option #",
+            "looks fine",
         )
     ):
         return "followup"

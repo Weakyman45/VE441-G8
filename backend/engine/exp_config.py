@@ -12,6 +12,7 @@
     $env:VS_VERIFIER="llm"            # 消融三:LLM 校验 + unknown 容错(完整版,默认)
 
     $env:VS_REVIEWS="0"               # 关闭评论语义召回 / 评论方面信号(Reviewer)
+    $env:VS_TEXT_SEMANTIC="0"         # 关闭文本向量语义召回(仅关键词)
     $env:VS_INTENT_SHORTCIRCUIT="0"   # 关闭 refine/followup 短路(总是重召回)
     $env:VS_PLANNER_REPLAN="0"        # 关闭 verify 拒绝后的 replan
     $env:VS_PLANNER_LLM="0"           # Planner 纯规则(无 LLM hints/意图)
@@ -53,6 +54,7 @@ class ExpConfig:
     # --- 创新点二:离线富集 + 属性来源分层 ---
     enrichment: bool                # 是否使用富集出的 enriched_text / 向量
     source_layering: bool           # 物理属性走 metadata(True)还是也让 VL 抽(False)
+    text_semantic: bool             # 文本向量语义召回(与关键词并集)
 
     # --- 创新点三:约束感知校验 ---
     verifier: str                   # off | rule | llm_strict | llm
@@ -69,6 +71,7 @@ class ExpConfig:
 
     # --- 通用 ---
     visual_top_k: int               # 视觉召回 top-K
+    text_top_k: int                 # 文本语义召回 top-K
     review_top_k: int               # 评论语义召回 top-K
     embedding_provider: str         # dashscope | hash(离线/无网时的确定性兜底)
 
@@ -91,6 +94,7 @@ class ExpConfig:
             "visual_recall": self.visual_recall,
             "enrichment": self.enrichment,
             "source_layering": self.source_layering,
+            "text_semantic": self.text_semantic,
             "verifier": self.verifier,
             "reviews": self.reviews,
             "intent_shortcircuit": self.intent_shortcircuit,
@@ -99,6 +103,7 @@ class ExpConfig:
             "memory": self.memory,
             "max_replans": self.max_replans,
             "visual_top_k": self.visual_top_k,
+            "text_top_k": self.text_top_k,
             "review_top_k": self.review_top_k,
             "embedding_provider": self.embedding_provider,
         }
@@ -115,6 +120,10 @@ def load_config() -> ExpConfig:
     except ValueError:
         r_top_k = 20
     try:
+        t_top_k = int((os.environ.get("VS_TEXT_TOPK") or "40").strip())
+    except ValueError:
+        t_top_k = 40
+    try:
         max_replans = int((os.environ.get("VS_MAX_REPLANS") or "2").strip())
     except ValueError:
         max_replans = 2
@@ -123,6 +132,7 @@ def load_config() -> ExpConfig:
         visual_recall=_flag("VS_VISUAL_RECALL", True),
         enrichment=_flag("VS_ENRICHMENT", True),
         source_layering=_flag("VS_SOURCE_LAYERING", True),
+        text_semantic=_flag("VS_TEXT_SEMANTIC", True),
         verifier=_choice("VS_VERIFIER", "llm", ("off", "rule", "llm_strict", "llm")),
         reviews=_flag("VS_REVIEWS", True),
         intent_shortcircuit=_flag("VS_INTENT_SHORTCIRCUIT", True),
@@ -131,6 +141,7 @@ def load_config() -> ExpConfig:
         memory=_flag("VS_MEMORY", True),
         max_replans=max(0, min(max_replans, 5)),
         visual_top_k=max(5, min(top_k, 200)),
+        text_top_k=max(5, min(t_top_k, 200)),
         review_top_k=max(5, min(r_top_k, 200)),
         embedding_provider=_choice(
             "VS_EMBEDDING_PROVIDER", "dashscope", ("dashscope", "hash")

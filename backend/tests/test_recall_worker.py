@@ -16,17 +16,28 @@ from engine.worker.recall_worker import RecallAgent, RecallResult  # noqa: E402
 
 
 def make_cfg(**kw):
-    """?????? recall ??????? cfg(?????? ExpConfig)?"""
+    """Minimal cfg for recall tests (not a full ExpConfig)."""
     from types import SimpleNamespace
-    base = dict(visual_top_k=40)
+    base = dict(
+        visual_top_k=40,
+        text_top_k=40,
+        text_semantic=True,
+        embedding_provider="hash",
+    )
     base.update(kw)
     return SimpleNamespace(**base)
 
 
 def make_plan(*, text=True, visual=False, infer_cat=False):
     from engine.modality_router import RoutePlan
+    if text and visual:
+        modality = "text_image"
+    elif visual:
+        modality = "image"
+    else:
+        modality = "text"
     return RoutePlan(
-        modality="test",
+        modality=modality,
         do_text_recall=text,
         do_visual_recall=visual,
         infer_category_from_image=infer_cat,
@@ -60,12 +71,16 @@ class TestMergeCandidates(unittest.TestCase):
 
 class TestRecallAgent(unittest.TestCase):
     def setUp(self):
-        # ????:search_fn ??????(t1/t2)
         self.text_hits = [{"id": "t1", "name": "A"}, {"id": "t2", "name": "B"}]
         self.search_fn = lambda params: [dict(x) for x in self.text_hits]
         self.agent = RecallAgent(self.search_fn)
+        # Avoid touching real catalog.db text index in unit tests.
+        self._text_emb = patch("engine.enrichment.has_text_embeddings", return_value=False)
+        self._text_emb.start()
 
-    # ---- ??? ---------------------------------------------------------- #
+    def tearDown(self):
+        self._text_emb.stop()
+
     def test_text_only_no_visual_calls(self):
         with patch("engine.enrichment.has_enrichment", return_value=True) as he, \
              patch("engine.enrichment.visual_recall") as vr, \
@@ -76,13 +91,12 @@ class TestRecallAgent(unittest.TestCase):
         self.assertEqual([c["id"] for c in res.candidates], ["t1", "t2"])
         self.assertEqual(res.text_count, 2)
         self.assertEqual(res.visual_count, 0)
-        vr.assert_not_called()          # ??????
-        avs.assert_not_called()         # ?? ? ?????
+        vr.assert_not_called()
+        avs.assert_not_called()
         he.assert_not_called()
 
-    # ---- ??:?? + ?? + ???? ----------------------------------- #
     def test_text_image_merge_dedup_and_scores(self):
-        visual_hits = [{"id": "v1", "name": "V"}, {"id": "t2", "name": "B'"}]  # t2 ?????
+        visual_hits = [{"id": "v1", "name": "V"}, {"id": "t2", "name": "B'"}]
 
         def fake_attach(cands, data, mime=None):
             for c in cands:
@@ -96,16 +110,16 @@ class TestRecallAgent(unittest.TestCase):
                                     route_plan=make_plan(text=True, visual=True),
                                     cfg=make_cfg(), query_image=IMG)
 
-        # ????:????(t1,t2),????(v1);t2 ?????
-        self.assertEqual([c["id"] for c in res.candidates], ["t1", "t2", "v1"])
+        self.assertEqual([c["id"] for c in res.candidates], ["t2", "t1", "v1"])
         self.assertEqual(res.text_count, 2)
         self.assertEqual(res.visual_count, 2)
-        # ????(???????)???????
         self.assertTrue(all("_visual_score" in c for c in res.candidates))
+        self.assertTrue(all("_rrf_score" in c for c in res.candidates))
+        # t2 appears in both lists → highest RRF
+        self.assertGreater(res.candidates[0]["_rrf_score"], res.candidates[1]["_rrf_score"])
         vr.assert_called_once()
         avs.assert_called_once()
 
-    # ---- ???:?????? ------------------------------------------- #
     def test_image_only_skips_text_recall(self):
         search_fn = unittest_fail_if_called(self)
         agent = RecallAgent(search_fn)
@@ -119,11 +133,9 @@ class TestRecallAgent(unittest.TestCase):
         self.assertEqual([c["id"] for c in res.candidates], ["v1"])
         self.assertEqual(res.text_count, 0)
         self.assertEqual(res.visual_count, 1)
-        # ?????:?????????
         _, kwargs = vr.call_args
         self.assertEqual(kwargs.get("category"), "footwear")
 
-    # ---- ????:????????? ---------------------------------- #
     def test_visual_gracefully_off_without_enrichment(self):
         with patch("engine.enrichment.has_enrichment", return_value=False), \
              patch("engine.enrichment.visual_recall") as vr, \
@@ -134,9 +146,8 @@ class TestRecallAgent(unittest.TestCase):
         self.assertEqual([c["id"] for c in res.candidates], ["t1", "t2"])
         self.assertEqual(res.visual_count, 0)
         vr.assert_not_called()
-        avs.assert_not_called()   # ??? ? ???
+        avs.assert_not_called()
 
-    # ---- ????:?????????? -------------------------------- #
     def test_visual_gracefully_off_without_image(self):
         with patch("engine.enrichment.has_enrichment", return_value=True), \
              patch("engine.enrichment.visual_recall") as vr, \
@@ -157,6 +168,36 @@ class TestRecallAgent(unittest.TestCase):
         self.assertEqual(set(d), {"count", "text", "visual"})
         self.assertEqual(d["count"], 2)
         self.assertEqual(d["text"], 2)
+
+    def test_text_semantic_union_with_keywords(self):
+        self._text_emb.stop()
+        sem_hits = [{"id": "s1", "name": "Semantic", "_text_score": 0.9}]
+        with patch("engine.enrichment.has_text_embeddings", return_value=True), \
+             patch("engine.enrichment.text_semantic_recall", return_value=sem_hits) as sem, \
+             patch("engine.enrichment.has_enrichment", return_value=False), \
+             patch("engine.enrichment.attach_text_scores", side_effect=lambda c, *a, **k: c):
+            res = self.agent.recall(
+                state=make_state(),
+                route_plan=make_plan(text=True),
+                cfg=make_cfg(text_semantic=True),
+                query_image=None,
+            )
+        self.assertEqual(set(c["id"] for c in res.candidates), {"t1", "t2", "s1"})
+        self.assertTrue(all("_rrf_score" in c for c in res.candidates))
+        sem.assert_called_once()
+
+        with patch("engine.enrichment.has_text_embeddings", return_value=True), \
+             patch("engine.enrichment.text_semantic_recall") as sem2, \
+             patch("engine.enrichment.has_enrichment", return_value=False):
+            res2 = self.agent.recall(
+                state=make_state(),
+                route_plan=make_plan(text=True),
+                cfg=make_cfg(text_semantic=False),
+                query_image=None,
+            )
+        self.assertEqual([c["id"] for c in res2.candidates], ["t1", "t2"])
+        sem2.assert_not_called()
+        self._text_emb.start()
 
 
 class TestVisualRecallRanking(unittest.TestCase):

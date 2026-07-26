@@ -78,7 +78,8 @@ class TestEnrichAndRecall(unittest.TestCase):
         from types import SimpleNamespace
         self._cfg_patch = patch("engine.enrichment.CONFIG",
                                 SimpleNamespace(embedding_provider="hash",
-                                                visual_top_k=40))
+                                                visual_top_k=40,
+                                                text_top_k=40))
         self._cfg_patch.start()
         conn = sqlite3.connect(self.db)
         conn.execute(
@@ -92,9 +93,11 @@ class TestEnrichAndRecall(unittest.TestCase):
         conn.commit()
         conn.close()
         e._INDEX_CACHE.clear()
+        e._TEXT_INDEX_CACHE.clear()
 
     def tearDown(self):
         e._INDEX_CACHE.clear()
+        e._TEXT_INDEX_CACHE.clear()
         self._cfg_patch.stop()
         if self._key is not None:
             os.environ["DASHSCOPE_API_KEY"] = self._key
@@ -106,8 +109,26 @@ class TestEnrichAndRecall(unittest.TestCase):
         e.ensure_columns(conn)  # 第二次不报错
         cols = {r[1] for r in conn.execute("PRAGMA table_info(laptops)").fetchall()}
         conn.close()
-        for c in ("image_embedding", "visual_attrs", "enriched_text"):
+        for c in ("image_embedding", "visual_attrs", "enriched_text", "text_embedding"):
             self.assertIn(c, cols)
+
+    def test_text_embed_then_semantic_recall(self):
+        stats = e.enrich_text_embeddings(self.db, provider="hash", verbose=False)
+        self.assertEqual(stats["processed"], 3)
+        self.assertEqual(stats["text_embeddings"], 3)
+        self.assertTrue(e.has_text_embeddings(self.db))
+
+        res = e.text_semantic_recall(
+            "white running shoes", db_path=self.db, top_k=3, provider="hash"
+        )
+        self.assertTrue(res)
+        self.assertEqual(res[0]["id"], "a")
+        self.assertTrue(all("_text_score" in r for r in res))
+        self.assertGreater(res[0]["_text_score"], res[-1]["_text_score"])
+
+        cands = [{"id": "b", "name": "Leather Boots"}, {"id": "a", "name": "x"}]
+        e.attach_text_scores(cands, "leather boots formal", db_path=self.db, provider="hash")
+        self.assertGreater(cands[0]["_text_score"], cands[1]["_text_score"])
 
     def test_enrich_then_visual_recall(self):
         stats = e.enrich_catalog(self.db, provider="hash", with_vl=False, verbose=False)

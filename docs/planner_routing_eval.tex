@@ -1,0 +1,152 @@
+% Planner routing evaluation section (English).
+% Requires: \usepackage{booktabs} \usepackage{amsmath}
+% Latest numbers from backend/data/eval/planner_routing_summary.json (N=100, online LLM Full).
+
+\section{Planner Routing Evaluation}
+\label{sec:planner-eval}
+
+\subsection{Goal}
+We evaluate the Planner as a \emph{control-plane} module: it decides \emph{how} the multi-agent worker should act (intent, short-circuit, reference resolution, safety refusal, and stage DAG), rather than selecting final catalog items from candidates.
+We compare a full Planner configuration against a fixed-pipeline ablation that disables modality-adaptive routing, intent short-circuiting, memory/reference resolution, re-planning, and Planner-side LLM calls.
+End-task ranking quality (e.g., Hit@$K$) is out of scope here; we focus on routing correctness and latency.
+
+\subsection{Metrics}
+\begin{description}
+  \item[Intent Acc.] Fraction of cases where predicted intent matches gold
+    ($\texttt{new\_search}$ / $\texttt{refine}$ / $\texttt{followup}$ / $\texttt{compare}$ / $\texttt{refuse}$).
+  \item[SC Acc.] Short-circuit accuracy: whether the Planner correctly chooses
+    $\texttt{rerank\_existing}$ (no re-retrieval) versus a full recall DAG.
+  \item[Ref Acc.] Reference-resolution accuracy on follow-up cases that carry a gold product id
+    (e.g., ``the second one'' $\rightarrow$ the correct id); computed on $n_{\mathrm{ref}}=20$ cases.
+  \item[Refuse Acc.] Safety accuracy: whether dangerous/restricted requests are refused
+    ($\texttt{refused=true}$) and ordinary requests are not.
+  \item[DAG Acc.] Exact match between predicted stage sequence and gold stages
+    (e.g., $\texttt{text\_recall}\!\rightarrow\!\texttt{verify}\!\rightarrow\!\texttt{recommend}$
+    or $\texttt{rerank\_existing}$).
+  \item[Planner $P_{50}$] Median wall-clock latency of $\texttt{planner.plan}(\cdot)$ only (ms).
+  \item[E2E $P_{50}$] Median end-to-end latency of Planner + Executor
+    (recall/verify/recommend or rerank), excluding Talker/audio (ms).
+\end{description}
+
+\subsection{Dataset Construction}
+We construct a deterministic routing benchmark with a template-based generator
+(\texttt{scripts/build\_planner\_cases.py}, seed $=42$).
+Each case provides an utterance, a preference snapshot, an optional prior recommendation bundle,
+optional image flags, and gold routing labels.
+Gold stage sequences are derived by the same deterministic rules as \texttt{build\_dag}
+(refuse $\rightarrow$ empty; short-circuit $\rightarrow$ $[\texttt{rerank\_existing}]$;
+otherwise modality-conditioned recall $\rightarrow$ verify $\rightarrow$ recommend).
+Prior bundles use three synthetic ranked products ($\texttt{prod\_a/b/c}$) so reference ids are exact and reproducible.
+
+\paragraph{Size and buckets.}
+The evaluation set contains \textbf{100} cases:
+\begin{itemize}
+  \item \textbf{new\_search} (24): first-turn product seeks (Chinese/English); gold intent
+    $\texttt{new\_search}$; full text DAG; no short-circuit.
+  \item \textbf{refine} (24): constraint edits after a seeded top-3 bundle
+    (e.g., cheaper / portable); gold intent $\texttt{refine}$; short-circuit to
+    $\texttt{rerank\_existing}$.
+  \item \textbf{followup} (24): ordinal/deictic references or comparisons over the same bundle
+    (e.g., ``第二个'', ``the second one'', ``compare \ldots'');
+    $20$ of them annotate $\texttt{ref\_product\_id}$ for Ref Acc.; short-circuit expected.
+  \item \textbf{safety} (14): restricted/dangerous requests aligned with the shopping-safety lexicon;
+    gold $\texttt{should\_refuse=true}$; empty stage list.
+  \item \textbf{modality} (14): text+image / image-only flags for modality-adaptive DAG labels
+    (visual stages are suppressed at evaluation time if visual enrichment is unavailable,
+    matching the deployed capability gate).
+\end{itemize}
+
+\subsection{Experimental Setup}
+\paragraph{Variants.}
+\begin{itemize}
+  \item \textbf{Full:} modality routing, intent short-circuit, memory/reference resolution,
+    Planner LLM, and replan flags enabled; verifier set to \texttt{rule} for lower variance.
+  \item \textbf{Fixed:} $\texttt{VS\_MODALITY\_ROUTING{=}0}$,
+    $\texttt{VS\_INTENT\_SHORTCIRCUIT{=}0}$,
+    $\texttt{VS\_MEMORY{=}0}$,
+    $\texttt{VS\_PLANNER\_REPLAN{=}0}$,
+    $\texttt{VS\_PLANNER\_LLM{=}0}$,
+    $\texttt{VS\_VISUAL\_RECALL{=}0}$
+    (non-adaptive text pipeline when not refused).
+\end{itemize}
+
+\paragraph{Procedure.}
+For each variant and each of the $100$ cases we (i)~rebuild \texttt{SessionState} from the case JSON,
+(ii)~call \texttt{planner.plan}, scoring Intent/SC/Ref/Refuse/DAG and Planner latency,
+(iii)~run the Executor to record E2E latency only (no Hit@$K$).
+Evaluation is implemented in \texttt{scripts/eval\_planner\_routing.py}.
+Full uses online Qwen chat for Planner intent/hints; Fixed is rules-only.
+
+\subsection{Results}
+\begin{table}[t]
+  \centering
+  \caption{Planner routing correctness and latency on the \textbf{100}-case benchmark.
+  Ref Acc.\ uses only follow-up cases with a gold product id ($n_{\mathrm{ref}}=20$).
+  Latency is median ($P_{50}$) in milliseconds.}
+  \label{tab:planner-routing}
+  \begin{tabular}{lccccccc}
+    \toprule
+    Variant & Intent & SC & Ref & Refuse & DAG & Planner $P_{50}$ & E2E $P_{50}$ \\
+    \midrule
+    Full  & 0.960 & 1.000 & 1.000 & 1.000 & 1.000 & 4968.4 & 6360.3 \\
+    Fixed & 1.000 & 0.520 & 0.000 & 1.000 & 0.520 & 1.2    & 1876.4 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \caption{Per-bucket Intent / SC / DAG accuracy for Full vs.\ Fixed ($N=100$).
+  Ref Acc.\ on \texttt{followup}: Full $=1.000$, Fixed $=0.000$ ($n_{\mathrm{ref}}=20$).}
+  \label{tab:planner-routing-bucket}
+  \begin{tabular}{lccccc}
+    \toprule
+    Bucket ($n$) & Variant & Intent & SC & DAG \\
+    \midrule
+    new\_search (24) & Full  & 1.000 & 1.000 & 1.000 \\
+    new\_search (24) & Fixed & 1.000 & 1.000 & 1.000 \\
+    refine (24)      & Full  & 1.000 & 1.000 & 1.000 \\
+    refine (24)      & Fixed & 1.000 & 0.000 & 0.000 \\
+    followup (24)    & Full  & 0.958 & 1.000 & 1.000 \\
+    followup (24)    & Fixed & 1.000 & 0.000 & 0.000 \\
+    safety (14)      & Full  & 1.000 & 1.000 & 1.000 \\
+    safety (14)      & Fixed & 1.000 & 1.000 & 1.000 \\
+    modality (14)    & Full  & 0.786 & 1.000 & 1.000 \\
+    modality (14)    & Fixed & 1.000 & 1.000 & 1.000 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Analysis}
+\paragraph{Routing quality (Full vs.\ Fixed).}
+On $N{=}100$ cases, Full keeps perfect short-circuiting, reference binding, safety refusal, and DAG fidelity
+(SC $=$ Ref $=$ Refuse $=$ DAG $=1.000$), with overall Intent Acc.\ $=0.960$.
+Fixed matches Intent ($1.000$) and Refuse ($1.000$)---rule safety still fires and rule intent classification still runs---but collapses on multi-turn control:
+SC Acc.\ and DAG Acc.\ both fall to $0.520$ because all \texttt{refine}/\texttt{followup} cases
+($24{+}24$) are forced through
+$\texttt{text\_recall}\!\rightarrow\!\texttt{verify}\!\rightarrow\!\texttt{recommend}$
+instead of $\texttt{rerank\_existing}$.
+Ref Acc.\ falls to $0$ ($0/20$) because memory/reference resolution is disabled, so ordinal mentions are not bound to product ids.
+Per-bucket results (Table~\ref{tab:planner-routing-bucket}) make the gap explicit:
+on \texttt{new\_search} and \texttt{safety} the two variants agree, while on \texttt{refine}/\texttt{followup} Fixed SC/DAG drop to $0$.
+This is precisely the Planner's control-plane value in this section: not better catalog scoring, but correct decisions about \emph{when} to re-retrieve, rerank, resolve references, and assemble the stage graph.
+
+\paragraph{Where Full Intent is imperfect.}
+Full Intent Acc.\ is slightly below Fixed ($0.960$ vs.\ $1.000$).
+Errors concentrate in the \texttt{modality} bucket (Intent Acc.\ $0.786$):
+with an online LLM, a few image-conditioned utterances are labeled as non-$\texttt{new\_search}$ intents,
+whereas the Fixed rules path always emits $\texttt{new\_search}$ for these first-turn templates.
+Importantly, Full still compiles the correct non-short-circuit DAG (DAG Acc.\ $=1.000$ on modality),
+so the residual Intent noise does not break stage routing on this set.
+\texttt{followup} Intent Acc.\ remains high ($0.958$) with perfect SC/DAG/Ref.
+
+\paragraph{Latency.}
+Full Planner latency is much higher ($P_{50}\!\approx\!4.97$s) because online LLM calls are used for intent/hints;
+Fixed is rules-only ($P_{50}\!\approx\!1.2$ms).
+E2E follows the same pattern ($P_{50}\!\approx\!6.36$s vs.\ $1.88$s): Full pays Planner LLM cost even when the Executor short-circuits.
+Thus Full wins decisively on multi-turn and referential routing correctness, while Fixed is cheaper but systematically mis-routes refine/followup traffic.
+In deployment, Planner LLM can be reserved for uncertain turns, or a distilled/rules-first path can be used under tight latency budgets---\emph{without} abandoning short-circuit and memory gates, which Fixed disables and which account for the SC/DAG/Ref collapses above.
+
+\paragraph{Takeaway.}
+On a 100-case routing benchmark, the full Planner preserves safety refusal while restoring short-circuiting, reference binding, and DAG fidelity that the fixed pipeline loses on multi-turn dialogue.
+The primary trade-off observed here is Planner LLM latency, not a collapse in stage-routing accuracy.

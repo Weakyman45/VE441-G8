@@ -26,9 +26,11 @@ class TestExpConfig(unittest.TestCase):
         self.assertTrue(c.visual_recall)
         self.assertTrue(c.enrichment)
         self.assertTrue(c.source_layering)
+        self.assertTrue(c.text_semantic)
         self.assertEqual(c.verifier, "llm")
         self.assertTrue(c.reviews)
         self.assertEqual(c.visual_top_k, 40)
+        self.assertEqual(c.text_top_k, 40)
         self.assertEqual(c.review_top_k, 20)
         self.assertEqual(c.embedding_provider, "dashscope")
         self.assertTrue(c.verifier_enabled)
@@ -97,10 +99,20 @@ class TestExpConfig(unittest.TestCase):
     def test_summary_keys(self):
         s = exp_config.load_config().summary()
         self.assertEqual(set(s), {"modality_routing", "visual_recall", "enrichment",
-                                  "source_layering", "verifier", "reviews",
+                                  "source_layering", "text_semantic", "verifier", "reviews",
                                   "intent_shortcircuit", "planner_replan", "planner_llm",
                                   "memory", "max_replans",
-                                  "visual_top_k", "review_top_k", "embedding_provider"})
+                                  "visual_top_k", "text_top_k", "review_top_k",
+                                  "embedding_provider"})
+
+    def test_text_semantic_flag_and_topk(self):
+        os.environ["VS_TEXT_SEMANTIC"] = "0"
+        self.assertFalse(exp_config.load_config().text_semantic)
+        del os.environ["VS_TEXT_SEMANTIC"]
+        os.environ["VS_TEXT_TOPK"] = "1"
+        self.assertEqual(exp_config.load_config().text_top_k, 5)
+        os.environ["VS_TEXT_TOPK"] = "9999"
+        self.assertEqual(exp_config.load_config().text_top_k, 200)
 
     def test_planner_flags_default_on(self):
         c = exp_config.load_config()

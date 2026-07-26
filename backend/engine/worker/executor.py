@@ -15,6 +15,7 @@ from ..query_fusion import (
     apply_image_attributes,
     fuse_text_image_query,
     normalize_fuse_weights,
+    rrf_fuse,
 )
 from ..verifier import verify_candidates
 from .plan_schema import (
@@ -26,7 +27,6 @@ from .plan_schema import (
 )
 from .recall_worker import RecallAgent
 from .recommend_worker import rank_products
-from .search_worker import run_search
 
 
 @dataclass
@@ -131,13 +131,11 @@ class Executor:
                         pref = PreferenceProfile(
                             **{**pref.to_dict(), "search_keywords": query_hint.split()}
                         )
-                    text_cands = run_search(
+                    text_cands = self.recall.text_recall(
                         pref,
-                        self.search_fn,
+                        cfg,
                         query_hint=params.get("query_hint") or query_hint,
                     )
-                    for c in text_cands:
-                        c.setdefault("_text_score", 1.0)
                     result.stage_trace.append({"agent": agent, "count": len(text_cands)})
                 elif agent == AGENT_VISUAL_RECALL:
                     cat = None
@@ -146,17 +144,32 @@ class Executor:
                     visual_cands = self.recall.image_recall(query_image, cat, cfg)
                     result.stage_trace.append({"agent": agent, "count": len(visual_cands)})
                 elif agent == AGENT_VERIFY:
-                    candidates = _merge(text_cands, visual_cands) if not candidates else candidates
-                    if query_image:
-                        try:
-                            from .. import enrichment
+                    candidates = _merge(
+                        text_cands,
+                        visual_cands,
+                        weights=[fuse_weights.get("text", 1.0), fuse_weights.get("visual", 1.0)],
+                    ) if not candidates else candidates
+                    try:
+                        from .. import enrichment
+                        from ..intent import preference_search_query
 
-                            if enrichment.has_enrichment():
-                                enrichment.attach_visual_scores(
-                                    candidates, query_image[0], mime=query_image[1]
-                                )
-                        except Exception:
-                            pass
+                        if query_image and enrichment.has_enrichment():
+                            enrichment.attach_visual_scores(
+                                candidates, query_image[0], mime=query_image[1]
+                            )
+                        q = (
+                            " ".join(state.preference.search_keywords).strip()
+                            or (query_hint or "").strip()
+                            or preference_search_query(state.preference)
+                        )
+                        if q and enrichment.has_text_embeddings():
+                            enrichment.attach_text_scores(
+                                candidates,
+                                q,
+                                provider=getattr(cfg, "embedding_provider", None),
+                            )
+                    except Exception:
+                        pass
                     reverse = bool(params.get("reverse_verify") or route.get("reverse_verify"))
                     verified = verify_candidates(
                         state.preference,
@@ -191,7 +204,11 @@ class Executor:
                             result.reject_reason = _summarize_rejects(result.rejected)
                             return result
                 elif agent == AGENT_RECOMMEND:
-                    candidates = _merge(text_cands, visual_cands) if not candidates else candidates
+                    candidates = _merge(
+                        text_cands,
+                        visual_cands,
+                        weights=[fuse_weights.get("text", 1.0), fuse_weights.get("visual", 1.0)],
+                    ) if not candidates else candidates
                     if query_image and candidates:
                         try:
                             from .. import enrichment
@@ -291,17 +308,19 @@ def _focus_ids(plan: dict[str, Any]) -> list[str]:
     return out
 
 
-def _merge(*groups: list[dict]) -> list[dict]:
-    merged: list[dict] = []
-    seen: set[str] = set()
-    for group in groups:
-        for item in group or []:
-            pid = str(item.get("id") or "")
-            if not pid or pid in seen:
+def _merge(*groups: list[dict], weights: list[float] | None = None) -> list[dict]:
+    """Merge ranked recall lists with RRF (falls back to empty → [])."""
+    lists = [g for g in groups if g]
+    if not lists:
+        return []
+    ws = None
+    if weights is not None:
+        ws = []
+        for i, g in enumerate(groups):
+            if not g:
                 continue
-            seen.add(pid)
-            merged.append(item)
-    return merged
+            ws.append(float(weights[i]) if i < len(weights) else 1.0)
+    return rrf_fuse(lists, weights=ws)
 
 
 def _summarize_rejects(rejected: list[dict[str, Any]]) -> str:

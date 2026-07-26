@@ -1,7 +1,10 @@
-"""A_I (image attribute extract) and F_VL (text+image query fusion).
+"""A_I / F_VL query fusion + multi-retriever RRF (Reciprocal Rank Fusion).
 
-These run online before recall so image-only requests get text keywords, and
+A_I / F_VL run online before recall so image-only requests get text keywords, and
 joint text+image requests ground ambiguous language in the photo.
+
+RRF merges ranked lists from keyword / text-semantic / visual retrievers:
+  score(d) = Σ_i w_i / (k + rank_i(d)),  rank 1-based, default k=60.
 """
 
 from __future__ import annotations
@@ -10,6 +13,9 @@ from typing import Any
 
 from .llm.vision import describe_shopping_image, visual_context_text
 from .models import PreferenceProfile, SessionState
+
+# Cormack et al. RRF constant
+RRF_K = 60
 
 
 def default_fuse_weights(modality: str) -> dict[str, float]:
@@ -36,6 +42,105 @@ def normalize_fuse_weights(raw: dict[str, Any] | None, *, modality: str) -> dict
     if total <= 0:
         return base
     return {"text": text_w / total, "visual": visual_w / total}
+
+
+def rrf_fuse(
+    ranked_lists: list[list[dict[str, Any]]] | tuple[list[dict[str, Any]], ...],
+    *,
+    k: int = RRF_K,
+    weights: list[float] | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Reciprocal Rank Fusion over already-ranked candidate lists.
+
+    Each list is treated as rank-ordered (index 0 = rank 1). Items are merged by
+    ``id``; score fields ``_text_score`` / ``_visual_score`` keep the max seen.
+    Result is sorted by ``_rrf_score`` descending.
+    """
+    k = max(1, int(k or RRF_K))
+    scores: dict[str, float] = {}
+    items: dict[str, dict[str, Any]] = {}
+    sources: dict[str, list[str]] = {}
+
+    for li, group in enumerate(ranked_lists or []):
+        w = 1.0
+        if weights is not None and li < len(weights):
+            try:
+                w = float(weights[li])
+            except (TypeError, ValueError):
+                w = 1.0
+        if w <= 0:
+            continue
+        for rank, item in enumerate(group or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get("id") or "")
+            if not pid:
+                continue
+            scores[pid] = scores.get(pid, 0.0) + w / (k + rank)
+            if pid not in items:
+                items[pid] = dict(item)
+                sources[pid] = []
+            else:
+                for key in ("_text_score", "_visual_score"):
+                    cur = float(items[pid].get(key) or 0.0)
+                    nxt = float(item.get(key) or 0.0)
+                    if nxt > cur:
+                        items[pid][key] = item.get(key)
+                src = item.get("_recall_source")
+                if src and src not in sources[pid]:
+                    sources[pid].append(str(src))
+            src0 = item.get("_recall_source")
+            if src0 and str(src0) not in sources[pid]:
+                sources[pid].append(str(src0))
+
+    ordered = sorted(scores.keys(), key=lambda p: (-scores[p], p))
+    out: list[dict[str, Any]] = []
+    for pid in ordered:
+        d = items[pid]
+        d["_rrf_score"] = round(scores[pid], 6)
+        if sources.get(pid):
+            d["_recall_sources"] = list(sources[pid])
+        out.append(d)
+        if limit is not None and len(out) >= int(limit):
+            break
+    return out
+
+
+def rrf_fuse_score_lists(
+    candidates: list[dict[str, Any]],
+    score_keys: list[tuple[str, float]],
+    *,
+    k: int = RRF_K,
+) -> list[dict[str, Any]]:
+    """Build per-key ranked lists from score fields, then RRF-fuse.
+
+    ``score_keys`` is ``[(field_name, weight), ...]``; zero/empty fields skip.
+    """
+    if not candidates:
+        return []
+    lists: list[list[dict[str, Any]]] = []
+    weights: list[float] = []
+    for key, weight in score_keys:
+        try:
+            w = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if w <= 0:
+            continue
+        ranked = sorted(
+            candidates,
+            key=lambda c, kk=key: -float(c.get(kk) or 0.0),
+        )
+        # Skip lists where nobody has a positive signal
+        if not any(float(c.get(key) or 0.0) > 0 for c in ranked):
+            continue
+        lists.append(ranked)
+        weights.append(w)
+    if not lists:
+        # Preserve input order but still stamp a tiny RRF from a single pass
+        return rrf_fuse([list(candidates)], k=k, weights=[1.0])
+    return rrf_fuse(lists, k=k, weights=weights)
 
 
 def apply_image_attributes(

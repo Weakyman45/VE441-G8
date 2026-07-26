@@ -9,7 +9,7 @@ from ..conflicts import (
 )
 from ..llm.qwen_client import chat_completion, qwen_configured
 from ..models import PreferenceProfile, RankedProduct, RecommendationBundle
-from ..query_fusion import normalize_fuse_weights
+from ..query_fusion import normalize_fuse_weights, rrf_fuse_score_lists
 
 
 def rank_products(
@@ -25,6 +25,25 @@ def rank_products(
 ) -> RecommendationBundle:
     weights = normalize_fuse_weights(fuse_weights, modality=modality)
     query_tokens = _keyword_tokens(profile.search_keywords)
+
+    # Prefer recall-time RRF; otherwise build RRF from keyword / text / visual ranks.
+    has_rrf = any(float(c.get("_rrf_score") or 0.0) > 0 for c in candidates)
+    if not has_rrf and candidates:
+        for c in candidates:
+            name = str(c.get("name") or "").lower()
+            c["_kw_hits"] = float(sum(1 for t in query_tokens if t in name))
+        fused = rrf_fuse_score_lists(
+            candidates,
+            [
+                ("_kw_hits", weights["text"]),
+                ("_text_score", weights["text"]),
+                ("_visual_score", weights["visual"]),
+            ],
+        )
+        rrf_map = {str(c.get("id")): float(c.get("_rrf_score") or 0.0) for c in fused}
+        for c in candidates:
+            c["_rrf_score"] = rrf_map.get(str(c.get("id")), 0.0)
+
     scored: list[tuple[float, int, dict[str, Any], list[str]]] = []
     excluded: list[dict[str, str]] = []
     soft_conflicts: list[ConflictPacket] = []
@@ -34,13 +53,8 @@ def rank_products(
         if exclude_reason:
             excluded.append({"id": str(item.get("id", "")), "reason": exclude_reason})
             continue
-        name = str(item.get("name") or "").lower()
-        text_hits = sum(1 for t in query_tokens if t in name)
-        # Primary sort key blends keyword relevance with fused text/visual score.
-        fused_rank = (
-            weights["text"] * float(text_hits)
-            + weights["visual"] * float(item.get("_visual_score") or 0.0) * 5.0
-        )
+        # Primary sort key = RRF (multi-retriever fusion).
+        fused_rank = float(item.get("_rrf_score") or 0.0)
         scored.append((fused_rank, score, item, reasons))
 
         # Soft trade-off: expensive but strong visual match.
@@ -216,6 +230,12 @@ def _score(
     if matched:
         text_bonus = min(30, 8 * len(matched))
         reasons.append("Matches: " + ", ".join(matched)[:60])
+
+    text_sem = float(item.get("_text_score") or 0.0)
+    if text_sem > 0:
+        text_bonus = max(text_bonus, int(round(min(1.0, text_sem) * 20)))
+        if text_sem >= 0.45 and not matched:
+            reasons.append(f"Semantic match {text_sem:.2f}")
 
     visual = float(item.get("_visual_score") or 0.0)
     visual_bonus = 0
