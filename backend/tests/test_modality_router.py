@@ -10,9 +10,22 @@ from engine.models import SessionState, PreferenceProfile  # noqa: E402
 
 
 def cfg(**kw):
-    base = dict(modality_routing=True, visual_recall=True, enrichment=True,
-                source_layering=True, verifier="llm", reviews=True, visual_top_k=40,
-                review_top_k=20, embedding_provider="hash")
+    base = dict(
+        modality_routing=True,
+        visual_recall=True,
+        enrichment=True,
+        source_layering=True,
+        verifier="llm",
+        reviews=True,
+        intent_shortcircuit=True,
+        planner_replan=True,
+        planner_llm=True,
+        memory=True,
+        max_replans=2,
+        visual_top_k=40,
+        review_top_k=20,
+        embedding_provider="hash",
+    )
     base.update(kw)
     return ExpConfig(**base)
 

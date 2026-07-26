@@ -12,11 +12,16 @@
     $env:VS_VERIFIER="llm"            # 消融三:LLM 校验 + unknown 容错(完整版,默认)
 
     $env:VS_REVIEWS="0"               # 关闭评论语义召回 / 评论方面信号(Reviewer)
+    $env:VS_INTENT_SHORTCIRCUIT="0"   # 关闭 refine/followup 短路(总是重召回)
+    $env:VS_PLANNER_REPLAN="0"        # 关闭 verify 拒绝后的 replan
+    $env:VS_PLANNER_LLM="0"           # Planner 纯规则(无 LLM hints/意图)
+    $env:VS_MEMORY="0"                # 关闭记忆预填/引用消解/写回
 
 对应关系(见《创新点与实验设计.md》):
     创新点一  ↔ VS_MODALITY_ROUTING / VS_VISUAL_RECALL / VS_REVIEWS
     创新点二  ↔ VS_ENRICHMENT / VS_SOURCE_LAYERING
     创新点三  ↔ VS_VERIFIER
+    Planner   ↔ VS_INTENT_SHORTCIRCUIT / VS_PLANNER_REPLAN / VS_PLANNER_LLM / VS_MEMORY
 """
 
 from __future__ import annotations
@@ -55,6 +60,13 @@ class ExpConfig:
     # --- 创新点一(评论侧):Reviewer Agent 评论语义召回 ---
     reviews: bool                   # 是否启用评论语义召回 / 评论方面信号
 
+    # --- Planner / 执行控制 ---
+    intent_shortcircuit: bool       # refine/followup/compare 走 rerank_existing
+    planner_replan: bool            # verify 拒绝后是否回调 Planner 重规划
+    planner_llm: bool               # Planner 是否调用 LLM(意图/hints/relax)
+    memory: bool                    # 记忆预填 / 引用消解 / 写回
+    max_replans: int                # verify→replan 最大次数
+
     # --- 通用 ---
     visual_top_k: int               # 视觉召回 top-K
     review_top_k: int               # 评论语义召回 top-K
@@ -81,6 +93,11 @@ class ExpConfig:
             "source_layering": self.source_layering,
             "verifier": self.verifier,
             "reviews": self.reviews,
+            "intent_shortcircuit": self.intent_shortcircuit,
+            "planner_replan": self.planner_replan,
+            "planner_llm": self.planner_llm,
+            "memory": self.memory,
+            "max_replans": self.max_replans,
             "visual_top_k": self.visual_top_k,
             "review_top_k": self.review_top_k,
             "embedding_provider": self.embedding_provider,
@@ -97,6 +114,10 @@ def load_config() -> ExpConfig:
         r_top_k = int((os.environ.get("VS_REVIEW_TOPK") or "20").strip())
     except ValueError:
         r_top_k = 20
+    try:
+        max_replans = int((os.environ.get("VS_MAX_REPLANS") or "2").strip())
+    except ValueError:
+        max_replans = 2
     return ExpConfig(
         modality_routing=_flag("VS_MODALITY_ROUTING", True),
         visual_recall=_flag("VS_VISUAL_RECALL", True),
@@ -104,6 +125,11 @@ def load_config() -> ExpConfig:
         source_layering=_flag("VS_SOURCE_LAYERING", True),
         verifier=_choice("VS_VERIFIER", "llm", ("off", "rule", "llm_strict", "llm")),
         reviews=_flag("VS_REVIEWS", True),
+        intent_shortcircuit=_flag("VS_INTENT_SHORTCIRCUIT", True),
+        planner_replan=_flag("VS_PLANNER_REPLAN", True),
+        planner_llm=_flag("VS_PLANNER_LLM", True),
+        memory=_flag("VS_MEMORY", True),
+        max_replans=max(0, min(max_replans, 5)),
         visual_top_k=max(5, min(top_k, 200)),
         review_top_k=max(5, min(r_top_k, 200)),
         embedding_provider=_choice(

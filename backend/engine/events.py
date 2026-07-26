@@ -21,6 +21,8 @@ class EventType:
     WORKER_RECOMMENDATION_READY = "worker.recommendation_ready"
     WORKER_STATUS = "worker.status"
     SESSION_INTERRUPTED = "session.interrupted"
+    MEMORY_WRITE_REQUESTED = "memory.write_requested"
+    MEMORY_UPDATED = "memory.updated"
 
 
 @dataclass
