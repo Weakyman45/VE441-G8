@@ -69,6 +69,69 @@ def chat_completion(
     return text
 
 
+def chat_stream(
+    messages: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    temperature: float = 0.3,
+    timeout: float = 60.0,
+):
+    """Yield assistant text deltas from Qwen (DashScope compatible, stream=true).
+
+    Raises RuntimeError on failure (before the first delta)."""
+    api_key = (os.environ.get("DASHSCOPE_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("DASHSCOPE_API_KEY is not set")
+
+    base = (
+        os.environ.get("QWEN_CHAT_BASE_URL")
+        or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    ).rstrip("/")
+    chat_model = (model or os.environ.get("QWEN_CHAT_MODEL") or "qwen-plus").strip()
+
+    payload = {
+        "model": chat_model,
+        "temperature": temperature,
+        "messages": messages,
+        "stream": True,
+    }
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        },
+        method="POST",
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Qwen HTTP {exc.code}: {body[:400]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Qwen network error: {exc}") from exc
+
+    with resp:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            delta = (
+                ((obj.get("choices") or [{}])[0].get("delta") or {}).get("content")
+            )
+            if delta:
+                yield delta
+
+
 def chat_json(
     messages: list[dict[str, str]],
     *,

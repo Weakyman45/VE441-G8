@@ -12,10 +12,15 @@ SearchFn = Callable[[dict], list[dict]]
 def run_search(
     profile: PreferenceProfile,
     search_fn: SearchFn,
-    limit: int = 40,
+    limit: int = 80,
     query_hint: str | None = None,
 ) -> list[dict[str, Any]]:
-    q = (query_hint or "").strip() or preference_search_query(profile)
+    # Prefer the analysis' English catalog keywords — they are the richest and
+    # tuned to the (English) catalog. The planner's rephrased query_hint often
+    # narrows or drifts (e.g. "espresso" only, missing "coffee maker"), so it is
+    # only a fallback. preference_search_query is the last resort.
+    keyword_q = " ".join(profile.search_keywords).strip()
+    q = keyword_q or (query_hint or "").strip() or preference_search_query(profile)
     params: dict[str, list] = {"q": [q], "limit": [str(limit)], "sort": ["popular"]}
     if profile.budget:
         # Catalog prices are USD-ish; App shows ¥ — keep numeric filter soft.

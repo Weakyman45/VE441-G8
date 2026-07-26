@@ -32,9 +32,15 @@ def describe_shopping_image(
     prompt = (
         "You are the image understanding worker for a shopping assistant. "
         "Look at the uploaded reference image and extract purchase-relevant "
-        "signals for laptop recommendations. Return ONLY a JSON object with "
-        "keys: summary, product_category, visual_preferences, hard_constraints, "
-        "soft_preferences, search_keywords. Do not invent exact model names, "
+        "signals for ANY product category (e.g. shoes, phones, clothing, "
+        "appliances, laptops, etc.). Return ONLY a JSON object with keys: "
+        "summary, product_category, visual_preferences, hard_constraints, "
+        "soft_preferences, search_keywords. "
+        "`product_category` must be the concrete category you actually see in "
+        "the image (e.g. \"sneakers\", \"headphones\"), never assume laptop. "
+        "`search_keywords` must be 3-8 short English words/phrases best suited "
+        "to search a product catalog by name (brand, product type, color, "
+        "style, key visible attributes). Do not invent exact model names, "
         "prices, or specs unless clearly visible in the image."
     )
     if user_text.strip():
@@ -79,7 +85,7 @@ def describe_shopping_image(
         raw = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
         parsed = _parse_json_object(raw)
         parsed.setdefault("summary", raw[:180] if raw else "Reference image attached")
-        parsed.setdefault("product_category", "laptop")
+        parsed.setdefault("product_category", "")
         parsed.setdefault("visual_preferences", [])
         parsed.setdefault("hard_constraints", [])
         parsed.setdefault("soft_preferences", [])
@@ -125,11 +131,11 @@ def _parse_json_object(raw: str) -> dict:
 def _fallback(filename: str, reason: str) -> dict:
     return {
         "summary": f"Reference image attached: {filename}",
-        "product_category": "laptop",
+        "product_category": "",
         "visual_preferences": ["use the uploaded image as a style and context reference"],
         "hard_constraints": [],
         "soft_preferences": ["visual reference provided"],
-        "search_keywords": ["laptop"],
+        "search_keywords": [],
         "provider": "fallback",
         "warning": reason,
     }

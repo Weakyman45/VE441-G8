@@ -87,7 +87,7 @@
 <body>
   <main>
     <h1>VoiceShop++ PC 通话测试</h1>
-    <p class="sub">用电脑麦克风直接连本机后端（同一套 Qwen Omni Realtime），无需 Android 模拟器。</p>
+    <p class="sub">用电脑麦克风直接连本机后端（GPT Realtime 优先，Qwen Realtime 兜底），无需 Android 模拟器。</p>
 
     <div class="row">
       <button id="btnStart">开始通话</button>
@@ -98,13 +98,13 @@
     <div id="log" class="panel"></div>
     <p class="hint">
       浏览器会请求麦克风权限。请用 Chrome / Edge 打开本页。<br />
-      后端需已启动：<code>py -3 server.py --port 8000</code>，然后访问
-      <code>http://127.0.0.1:8000/voice-test</code>
+      后端需已启动，例如：<code>python3 backend/server.py --port 18765</code>，然后访问
+      <code id="currentUrl">当前 /voice-test 地址</code>
     </p>
   </main>
 
   <script>
-    const INPUT_RATE = 16000;
+    let inputRate = 16000;
     const OUTPUT_RATE = 24000;
 
     const btnStart = document.getElementById("btnStart");
@@ -112,6 +112,9 @@
     const statusDot = document.getElementById("statusDot");
     const statusText = document.getElementById("statusText");
     const logEl = document.getElementById("log");
+    const backendOrigin = location.protocol === "file:" ? "http://127.0.0.1:18765" : location.origin;
+    document.getElementById("currentUrl").textContent =
+      location.protocol === "file:" ? `${backendOrigin}/voice-test` : location.href;
 
     let ws = null;
     let mediaStream = null;
@@ -145,9 +148,9 @@
       return out;
     }
 
-    function downsampleTo16k(float32, inRate) {
-      if (inRate === INPUT_RATE) return float32;
-      const ratio = inRate / INPUT_RATE;
+    function resampleToInputRate(float32, inRate) {
+      if (inRate === inputRate) return float32;
+      const ratio = inRate / inputRate;
       const newLen = Math.round(float32.length / ratio);
       const result = new Float32Array(newLen);
       for (let i = 0; i < newLen; i++) {
@@ -211,20 +214,28 @@
     }
 
     async function startMic() {
-      mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          channelCount: 1,
-        },
-      });
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            channelCount: 1,
+          },
+        });
+      } catch (err) {
+        const name = err && err.name ? err.name : "MicrophoneError";
+        if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+          throw new Error("麦克风权限被拒绝。请在浏览器地址栏/站点设置中允许麦克风，或用 Chrome/Edge 打开当前 http://127.0.0.1 地址。");
+        }
+        throw err;
+      }
       audioCtx = new AudioContext();
       sourceNode = audioCtx.createMediaStreamSource(mediaStream);
       processor = audioCtx.createScriptProcessor(4096, 1, 1);
       processor.onaudioprocess = (e) => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         const input = e.inputBuffer.getChannelData(0);
-        const down = downsampleTo16k(input, audioCtx.sampleRate);
+        const down = resampleToInputRate(input, audioCtx.sampleRate);
         const pcm = floatTo16BitPCM(down);
         sendJson({ type: "input_audio_buffer.append", audio: pcm16ToBase64(pcm) });
       };
@@ -295,7 +306,7 @@
       setStatus("创建会话…", "");
       appendLog("正在创建 session…", "sys");
       try {
-        const res = await fetch("/api/v1/session", {
+        const res = await fetch(`${backendOrigin}/api/v1/session`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: "{}",
@@ -303,10 +314,16 @@
         const body = await res.json();
         if (!res.ok) throw new Error(JSON.stringify(body));
         const sid = body.session_id;
-        const wsPath = (body.ws_url || "/api/v1/qwen/realtime/ws").split("?")[0];
-        const proto = location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${proto}//${location.host}${wsPath}?session_id=${sid}`;
-        appendLog("session_id=" + sid, "sys");
+        const wsPath = (body.ws_url || "/api/v1/realtime/ws").split("?")[0];
+        const talker = body.talker || (wsPath.includes("/openai/") ? "openai" : "qwen");
+        const interruptionHandling = body.interruption_handling_enabled !== false;
+        inputRate = body.input_audio_sample_rate || (talker === "openai" ? 24000 : 16000);
+        const wsOrigin = backendOrigin.replace("https://", "wss://").replace("http://", "ws://");
+        const wsUrl = `${wsOrigin}${wsPath}?session_id=${sid}`;
+        appendLog(
+          `session_id=${sid} talker=${talker} input=${inputRate}Hz interruptions=${interruptionHandling ? "on" : "off"}`,
+          "sys"
+        );
         setStatus("连接 WebSocket…", "");
 
         await new Promise((resolve, reject) => {
@@ -325,25 +342,27 @@
           };
         });
 
-        // Ensure Tina for qwen3.5 (Cherry is rejected by this model).
-        sendJson({
-          type: "session.update",
-          session: {
-            modalities: ["text", "audio"],
-            voice: "Tina",
-            instructions: "You are VoiceShop++, a helpful retail shopping assistant. Always reply in English only. Help clarify product category, budget, must-haves, and constraints. Keep replies short.",
-            input_audio_format: "pcm",
-            output_audio_format: "pcm",
-            input_audio_transcription: { model: "qwen3-asr-flash-realtime", language: "en" },
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.4,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 800,
+        if (talker === "qwen") {
+          // Ensure Tina for qwen3.5 (Cherry is rejected by this model).
+          sendJson({
+            type: "session.update",
+            session: {
+              modalities: ["text", "audio"],
+              voice: "Tina",
+              instructions: qwenInstructions(interruptionHandling),
+              input_audio_format: "pcm",
+              output_audio_format: "pcm",
+              input_audio_transcription: { model: "qwen3-asr-flash-realtime", language: "en" },
+              turn_detection: {
+                type: "server_vad",
+                threshold: 0.4,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 800,
+              },
             },
-          },
-        });
-        appendLog("session.update voice=Tina", "sys");
+          });
+          appendLog("session.update voice=Tina", "sys");
+        }
 
         await startMic();
         setStatus("通话中 — 请说话", "on");
@@ -355,6 +374,30 @@
         btnStart.disabled = false;
         stopCall();
       }
+    }
+
+    function qwenInstructions(interruptionHandling) {
+      const base = "You are VoiceShop++, a helpful retail shopping assistant. Always reply in English only. Help clarify product category, budget, must-haves, and constraints. Keep replies short.";
+      if (!interruptionHandling) return base;
+      return `${base}
+
+If a prior assistant message contains [INTERRUPTED], that marker is the cut-off point. The user did not hear anything after that marker.
+
+## Handling interruptions (barge-in)
+
+The user can and will interrupt you mid-sentence. When that happens:
+
+1. You did NOT finish speaking. The user only heard the words up to the point where they cut in - never assume the rest was heard. Never claim or imply you "already mentioned" or "just said" something that came after the cut-off point.
+
+2. Whatever the user says when interrupting is their most current and highest-priority intent. Adopt it immediately and let it override your previous plan or the answer you were in the middle of giving.
+
+3. Be brief. Respond directly to what they now want. Do NOT re-read, recap, or repeat the recommendations or details they already heard before interrupting.
+
+4. Only restate something from the unspoken part if it is essential to the user's new request AND they were cut off before hearing it - and then keep it to a single short clause, not a re-listing.
+
+5. If the interruption is just a backchannel ("uh-huh", "okay", "right", "mm-hmm", "got it") or clearly not addressed to you (background speech, someone else talking), do NOT treat it as a new instruction. Continue naturally from where you were.
+
+Keep every reply short and spoken-style - one or two sentences.`;
     }
 
     function stopCall() {

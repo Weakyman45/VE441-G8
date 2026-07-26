@@ -9,7 +9,7 @@ from .models import PreferenceProfile
 def extract_preference(text: str, prior: PreferenceProfile | None = None) -> PreferenceProfile:
     """Rule-based preference extraction (Phase 1 — no LLM required)."""
     profile = PreferenceProfile(
-        category=(prior.category if prior else "laptop"),
+        category=(prior.category if prior else ""),
         budget=prior.budget if prior else None,
         use_case=prior.use_case if prior else "",
         platform=prior.platform if prior else "No preference",
@@ -18,6 +18,7 @@ def extract_preference(text: str, prior: PreferenceProfile | None = None) -> Pre
         soft=list(prior.soft) if prior else [],
         visual_context=prior.visual_context if prior else "",
         raw_query=text.strip(),
+        search_keywords=list(prior.search_keywords) if prior else [],
     )
     lower = text.lower()
 
@@ -68,9 +69,12 @@ def extract_preference(text: str, prior: PreferenceProfile | None = None) -> Pre
     if mem:
         _upsert(profile.hard, f"{mem.group(1)}GB RAM preferred")
 
+    # Only assign a category when the text clearly signals one; otherwise keep
+    # whatever prior/LLM analysis provided. Never force "laptop" — the catalog
+    # is now general-purpose, so a hardcoded default biases every search.
     if "phone" in lower or "手机" in lower:
         profile.category = "phone"
-    else:
+    elif any(k in lower for k in ("laptop", "notebook", "macbook", "笔记本", "电脑")):
         profile.category = "laptop"
 
     return profile
@@ -78,10 +82,14 @@ def extract_preference(text: str, prior: PreferenceProfile | None = None) -> Pre
 
 def preference_search_query(profile: PreferenceProfile) -> str:
     parts: list[str] = []
-    if profile.category:
+    # English keywords from the LLM brief come first — the catalog is English,
+    # so these are the terms most likely to actually match product names.
+    if profile.search_keywords:
+        parts.extend(profile.search_keywords)
+    # An ASCII/English category still helps; a Chinese one is dropped by the
+    # search tokenizer anyway, so only append when it looks English.
+    if profile.category and profile.category.isascii():
         parts.append(profile.category if profile.category != "phone" else "phone")
-    if profile.use_case:
-        parts.append(profile.use_case.split("/")[0])
     if profile.platform in ("Windows", "macOS"):
         parts.append("macbook" if profile.platform == "macOS" else "windows")
     soft_bits = " ".join(profile.soft + profile.hard)
@@ -92,7 +100,7 @@ def preference_search_query(profile: PreferenceProfile) -> str:
             parts.append(token)
     if profile.raw_query:
         parts.append(profile.raw_query)
-    return " ".join(parts) or "laptop"
+    return " ".join(parts).strip()
 
 
 def _upsert(values: list[str], label: str) -> None:

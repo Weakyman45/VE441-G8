@@ -1,10 +1,10 @@
 """VoiceShop++ backend — catalog API + Talker–Worker dual runtime.
 
-Default Talker stack is Qwen Omni Realtime (+ Qwen chat for Planner/Workers).
-OpenAI Realtime remains available on a separate path for later.
+Default Talker stack is GPT Realtime when OPENAI_API_KEY is available, with
+Qwen Omni Realtime as the fallback (+ Qwen chat for Planner/Workers).
 
-Run:
-    python3 backend/server.py --port 8000
+Run (from the project root; DB path is resolved relative to this file):
+    python backend/server.py --port 8000
 
 Endpoints:
     GET  /health
@@ -14,9 +14,9 @@ Endpoints:
     POST /api/v1/image
     GET  /api/v1/session/{id}
     GET  /api/v1/session/{id}/recommendations
-    GET  /api/v1/realtime/ws?session_id=...        (default Talker = Qwen)
+    GET  /api/v1/realtime/ws?session_id=...        (default Talker = auto)
     GET  /api/v1/qwen/realtime/ws?session_id=...   (Qwen Omni Talker)
-    GET  /api/v1/openai/realtime/ws?session_id=... (legacy GPT Realtime)
+    GET  /api/v1/openai/realtime/ws?session_id=... (GPT Realtime)
     GET  /api/v1/realtime/token                    (legacy OpenAI ephemeral token)
     GET  /voice-test                               (PC browser voice call test page)
 """
@@ -43,14 +43,24 @@ from engine.bus import EventBus
 from engine.events import Event, EventType
 from engine.intent import extract_preference
 from engine.logging_store import LoggingStore
+from engine.llm.analyze import analyze_need, analyze_need_stream
 from engine.llm.vision import describe_shopping_image, visual_context_text
 from engine.session import SessionStore
 from engine.talker.bridge import TalkerBridge
+from engine.talker.duplex_controls import (
+    ExperimentEventLogger,
+    HalfDuplexMicGate,
+    half_duplex_mic_gate_requested,
+)
+from engine.talker.denoise import build_talker_denoiser, talker_denoise_requested
+from engine.talker.local_realtime_vad import LocalRealtimeVadGate
+from engine.talker.shopping_safety import SHOPPING_SAFETY_BOUNDARIES, shopping_safety_enabled
 from engine.worker.runtime import WorkerRuntime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.path.join(HERE, "data", "catalog.db")
 ENV_FILE = os.path.join(HERE, ".env")
+FALLBACK_OPENAI_ENV_FILE = "/Users/YukiWang/Downloads/tau2-bench-dev-tau3/.env"
 ENGINE_LOG_DB = os.path.join(HERE, "data", "engine_logs.db")
 VOICE_TEST_HTML = os.path.join(HERE, "static", "voice_test.html")
 UPLOAD_DIR = os.path.join(HERE, "data", "uploads")
@@ -83,6 +93,7 @@ def load_dotenv(path: str = ENV_FILE, *, override: bool = True) -> None:
 
 
 load_dotenv()
+load_dotenv(FALLBACK_OPENAI_ENV_FILE, override=False)
 
 # Re-read after dotenv so later code sees the file values.
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "").strip()
@@ -91,8 +102,20 @@ QWEN_OMNI_MODEL = (
 ).strip()
 QWEN_OMNI_VOICE = (os.environ.get("QWEN_OMNI_VOICE") or "Tina").strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-REALTIME_MODEL = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime").strip()
-TALKER_PROVIDER = (os.environ.get("TALKER_PROVIDER") or "qwen").strip().lower()
+OPENAI_API_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+REALTIME_MODEL = (
+    os.environ.get("OPENAI_REALTIME_MODEL_OVERRIDE")
+    or os.environ.get("OPENAI_REALTIME_MODEL")
+    or "gpt-realtime"
+).strip()
+OPENAI_REALTIME_VOICE = os.environ.get("OPENAI_REALTIME_VOICE", "marin").strip() or "marin"
+OPENAI_TRANSCRIBE_MODEL = (
+    os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip()
+    or "gpt-4o-mini-transcribe"
+)
+TALKER_PROVIDER_REQUESTED = (os.environ.get("TALKER_PROVIDER") or "auto").strip().lower()
+DUPLEX_EXPERIMENT_CONDITION = os.environ.get("DUPLEX_EXPERIMENT_CONDITION", "").strip()
+DUPLEX_EXPERIMENT_LOG_DIR = os.environ.get("DUPLEX_EXPERIMENT_LOG_DIR", "").strip()
 
 COLUMNS = [
     "id", "name", "price", "rating", "rating_number", "display", "performance",
@@ -102,20 +125,115 @@ COLUMNS = [
 
 DB_PATH = DEFAULT_DB
 
-SHOPPING_INSTRUCTIONS = (
-    "You are VoiceShop++, a helpful retail shopping assistant (Talker). "
-    "Always reply in English only — never switch to Chinese or other languages. "
-    "Help shoppers clarify what they want to buy: product category, budget, must-haves, "
-    "nice-to-haves, brand preferences, and constraints. "
-    "Ask concise clarifying questions when critical fields are missing. "
-    "A background Worker may search a catalog; when Worker notes arrive, summarize them "
-    "naturally in English without inventing products. "
-    "Keep spoken replies short so the user can interrupt."
-)
+
+def env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+INTERRUPTED_MARKER = "[INTERRUPTED]"
+UNSPOKEN_MARKER = "[UNSPOKEN]"
+
+INTERRUPTION_INSTRUCTIONS = f"""
+If a prior assistant message contains {INTERRUPTED_MARKER}, that marker is the cut-off point.
+The user did not hear anything after that marker.
+If the message also contains {UNSPOKEN_MARKER}, the text after it is unspoken
+draft content from the interrupted reply. Treat it only as private context, not
+as something the user heard.
+
+## Handling interruptions (barge-in)
+
+The user can and will interrupt you mid-sentence. When that happens:
+
+1. You did NOT finish speaking. The user only heard the words up to the
+   point where they cut in - never assume the rest was heard. Never claim
+   or imply you "already mentioned" or "just said" something that came
+   after the cut-off point.
+
+2. Whatever the user says when interrupting is their most current and
+   highest-priority intent. Adopt it immediately and let it override your
+   previous plan or the answer you were in the middle of giving.
+
+3. Be brief. Respond directly to what they now want. Do NOT re-read,
+   recap, or repeat the recommendations or details they already heard
+   before interrupting.
+
+4. Only restate something from the unspoken part if it is essential to the
+   user's new request AND they were cut off before hearing it - and then
+   keep it to a single short clause, not a re-listing.
+
+5. If the interruption is just a backchannel ("uh-huh", "okay", "right",
+   "mm-hmm", "got it") or clearly not addressed to you (background speech,
+   someone else talking), do NOT treat it as a new instruction. Continue
+   naturally from where you were.
+
+Keep every reply short and spoken-style - one or two sentences.
+""".strip()
+
+
+def interruption_handling_enabled() -> bool:
+    return env_bool("INTERRUPTION_HANDLING_ENABLED", True)
+
+
+def build_shopping_instructions() -> str:
+    base = (
+        "You are VoiceShop++, a helpful retail shopping assistant (Talker). "
+        "Always reply in English only — never switch to Chinese or other languages. "
+        "Help shoppers clarify what they want to buy: product category, budget, must-haves, "
+        "nice-to-haves, brand preferences, and constraints. "
+        "Ask concise clarifying questions when critical fields are missing. "
+        "A background Worker may search a catalog; when Worker notes arrive, summarize them "
+        "naturally in English without inventing products. "
+        "Keep spoken replies short so the user can interrupt."
+    )
+    if shopping_safety_enabled():
+        base = f"{base}\n\n{SHOPPING_SAFETY_BOUNDARIES}"
+    if not interruption_handling_enabled():
+        return base
+    return f"{base}\n\n{INTERRUPTION_INSTRUCTIONS}"
+
+
+SHOPPING_INSTRUCTIONS = build_shopping_instructions()
+
+
+def resolve_talker_provider(requested: str | None = None) -> str:
+    """Resolve Talker provider with GPT Realtime preferred and Qwen as fallback."""
+    wanted = (requested or TALKER_PROVIDER_REQUESTED or "auto").strip().lower()
+    if wanted in ("gpt", "gpt-realtime", "gpt_realtime"):
+        wanted = "openai"
+    if wanted in ("auto", "default", ""):
+        return "openai" if OPENAI_API_KEY else "qwen"
+    if wanted == "openai" and not OPENAI_API_KEY and DASHSCOPE_API_KEY:
+        return "qwen"
+    if wanted == "qwen" and not DASHSCOPE_API_KEY and OPENAI_API_KEY:
+        return "openai"
+    return wanted
+
+
+def talker_input_sample_rate(provider: str | None = None) -> int:
+    return 24_000 if resolve_talker_provider(provider) == "openai" else 16_000
+
+
+def local_vad_requested() -> bool:
+    return env_bool("LOCAL_VAD_ENABLED", True)
+
+
+def duplex_experiment_config(provider: str | None = None) -> dict:
+    talker = resolve_talker_provider(provider)
+    return {
+        "condition": DUPLEX_EXPERIMENT_CONDITION or None,
+        "talker": talker,
+        "interruption_handling_enabled": interruption_handling_enabled(),
+        "local_vad_enabled": local_vad_requested() and talker in ("openai", "qwen"),
+        "half_duplex_mic_gate_enabled": half_duplex_mic_gate_requested(),
+        "experiment_log_dir": DUPLEX_EXPERIMENT_LOG_DIR or None,
+    }
 
 
 def default_talker_ws_path() -> str:
-    if TALKER_PROVIDER == "openai":
+    if resolve_talker_provider() == "openai":
         return "/api/v1/openai/realtime/ws"
     return "/api/v1/qwen/realtime/ws"
 
@@ -144,18 +262,18 @@ def mint_realtime_token() -> dict:
                         "create_response": True,
                         "interrupt_response": True,
                     },
-                    "transcription": {"model": "gpt-4o-mini-transcribe"},
+                    "transcription": {"model": OPENAI_TRANSCRIBE_MODEL},
                 },
                 "output": {
                     "format": {"type": "audio/pcm", "rate": 24000},
-                    "voice": "marin",
+                    "voice": OPENAI_REALTIME_VOICE,
                 },
             },
         }
     }
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        "https://api.openai.com/v1/realtime/client_secrets",
+        f"{OPENAI_API_BASE_URL}/realtime/client_secrets",
         data=body,
         headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -190,6 +308,28 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return item
 
 
+def _session_image_data_urls(state, max_images: int = 3) -> list[str]:
+    """Load the session's most recent uploaded image(s) from disk and return
+    them as base64 data URLs, so the need-analysis LLM can consume the picture
+    as multimodal input alongside the text (not just pre-extracted keywords)."""
+    urls: list[str] = []
+    for ref in (getattr(state, "image_refs", None) or [])[-max_images:]:
+        path = ref.get("path")
+        mime = ref.get("mime_type") or "image/jpeg"
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        if not raw or len(raw) > MAX_IMAGE_BYTES:
+            continue
+        b64 = base64.b64encode(raw).decode("ascii")
+        urls.append(f"data:{mime};base64,{b64}")
+    return urls
+
+
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -214,11 +354,10 @@ def search(params: dict) -> list[dict]:
         args.append(min_rating)
 
     tokens = [t for t in re.split(r"[^a-z0-9]+", q) if len(t) >= 3]
-    tokens = [t for t in tokens if t not in _STOPWORDS][:6]
-    if tokens:
-        clause = " OR ".join(["LOWER(name) LIKE ?"] * len(tokens))
-        where.append(f"({clause})")
-        args.extend([f"%{t}%" for t in tokens])
+    # Keep more tokens (10) so specific product words survive alongside generic
+    # ones; relevance ordering below decides what actually ranks.
+    seen: set[str] = set()
+    tokens = [t for t in tokens if t not in _STOPWORDS and not (t in seen or seen.add(t))][:10]
 
     order = {
         "price": "price > 0 DESC, price ASC",
@@ -226,10 +365,25 @@ def search(params: dict) -> list[dict]:
         "popular": "rating_number DESC",
     }.get(sort, "rating_number DESC")
 
+    # Relevance = how many query tokens appear in the product name. Order by that
+    # FIRST so an item matching several query words (e.g. a real "running shoe")
+    # beats a merely-popular item that happens to share one generic word like
+    # "breathable". Args must be laid out in SQL order: WHERE ... ORDER BY ... LIMIT.
+    rel_args: list = []
+    order_by = order
+    if tokens:
+        clause = " OR ".join(["LOWER(name) LIKE ?"] * len(tokens))
+        where.append(f"({clause})")
+        args.extend([f"%{t}%" for t in tokens])
+        rel_expr = " + ".join(["(LOWER(name) LIKE ?)"] * len(tokens))
+        rel_args = [f"%{t}%" for t in tokens]
+        order_by = f"({rel_expr}) DESC, {order}"
+
     sql = "SELECT * FROM laptops"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += f" ORDER BY {order} LIMIT ?"
+    sql += f" ORDER BY {order_by} LIMIT ?"
+    args.extend(rel_args)
     args.append(limit)
 
     conn = _connect()
@@ -258,9 +412,20 @@ def count() -> int:
 
 
 _STOPWORDS = {
-    "the", "and", "for", "with", "under", "need", "want", "laptop", "laptops",
+    "the", "and", "for", "with", "under", "need", "want",
     "good", "budget", "care", "about", "that", "have", "give", "your", "some",
     "rmb", "usd", "dollar", "dollars",
+    # Generic colors / adjectives / demographics: these match almost anything
+    # in an English catalog (a "Black/White dress" matched a shoe query), so we
+    # drop them from matching and let the real product nouns decide relevance.
+    "white", "black", "red", "blue", "green", "yellow", "gray", "grey", "pink",
+    "purple", "orange", "brown", "silver", "gold", "beige", "navy",
+    "color", "colors", "colour", "colours", "multicolor",
+    "breathable", "lightweight", "comfortable", "comfy", "casual", "waterproof",
+    "durable", "premium", "quality", "soft", "warm", "cool", "versatile",
+    "simple", "classic", "stylish", "fashion", "fashionable", "new", "best",
+    "size", "sizes", "women", "womens", "woman", "men", "mens", "man",
+    "unisex", "adult", "adults", "kids", "boys", "girls",
 }
 
 
@@ -293,6 +458,35 @@ def _image_ext(mime_type: str, filename: str) -> str:
     if "webp" in mime_type:
         return ".webp"
     return ".jpg"
+
+
+def _dedup_append(values: list, item: str) -> None:
+    item = (item or "").strip()
+    if not item:
+        return
+    low = item.lower()
+    if all(low != v.lower() for v in values):
+        values.append(item)
+
+
+def _merge_llm_analysis(profile, analysis: dict) -> None:
+    """Fold an LLM shopping brief into the rule-based PreferenceProfile so the
+    Worker (search + recommend) actually uses the model's understanding."""
+    if analysis.get("budget"):
+        profile.budget = analysis["budget"]
+    if analysis.get("category"):
+        profile.category = analysis["category"]
+    if analysis.get("use_case"):
+        profile.use_case = analysis["use_case"]
+    if analysis.get("platform") in ("Windows", "macOS"):
+        profile.platform = analysis["platform"]
+    for m in analysis.get("must_haves", []):
+        _dedup_append(profile.hard, m)
+    for s in analysis.get("nice_to_haves", []):
+        _dedup_append(profile.soft, s)
+    # English catalog keywords drive the Worker search, so keep the freshest set.
+    if analysis.get("search_keywords"):
+        profile.search_keywords = list(analysis["search_keywords"])
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -329,6 +523,88 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8") or "{}")
 
+    def _stream_line(self, obj: dict) -> None:
+        """Write one newline-delimited JSON object to the open response stream."""
+        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+        self.wfile.write(data)
+        self.wfile.flush()
+
+    def _stream_analyze(self, sid: str, text: str) -> None:
+        """Stream the LLM's need-analysis reasoning live, then a final brief.
+
+        Wire format: one JSON object per line (the server runs HTTP/1.0, so the
+        response body is delimited by connection close):
+            {"type":"delta","text":"...partial reasoning..."}
+            ...
+            {"type":"done","analysis":{...},"preference":{...}}
+
+        On success the final brief is folded into the session preference exactly
+        like the blocking /text endpoint, so the Worker recommendations stay in
+        sync whether the client used streaming or not.
+        """
+        state = SESSION_STORE.create_or_get(sid)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        prior = state.preference.to_dict()
+        session_images = _session_image_data_urls(state)
+        analysis: dict | None = None
+        try:
+            for kind, payload in analyze_need_stream(text, prior=prior, images=session_images):
+                if kind == "delta":
+                    self._stream_line({"type": "delta", "text": payload})
+                elif kind == "done":
+                    analysis = payload
+        except (BrokenPipeError, ConnectionResetError):
+            return  # client paused / disconnected mid-stream
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            try:
+                self._stream_line({"type": "error", "detail": str(exc)[:200]})
+            except OSError:
+                pass
+            return
+
+        try:
+            combined_text = text
+            if state.preference.visual_context:
+                combined_text = (
+                    f"{text}\n\nImage context already attached: "
+                    f"{state.preference.visual_context}"
+                )
+            updated = extract_preference(combined_text, state.preference)
+            if state.preference.visual_context and not updated.visual_context:
+                updated.visual_context = state.preference.visual_context
+            if analysis and analysis.get("provider") == "qwen":
+                _merge_llm_analysis(updated, analysis)
+
+            SESSION_STORE.update_preference(sid, updated)
+            SESSION_STORE.append_turn(sid, "user", text)
+            LOG_STORE.log_conversation(sid, "user", text)
+            LOG_STORE.log_trace(sid, "text", "intent_updated", {
+                **updated.to_dict(), "llm_provider": (analysis or {}).get("provider"),
+            })
+            EVENT_BUS.emit(Event(
+                type=EventType.USER_INTENT_UPDATED,
+                session_id=sid,
+                payload={**updated.to_dict(), "source": {"type": "text_input"}},
+            ))
+            self._stream_line({
+                "type": "done",
+                "analysis": analysis or {},
+                "preference": updated.to_dict(),
+            })
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as exc:  # noqa: BLE001 - stream already started; never fall through to _send(500)
+            try:
+                self._stream_line({"type": "error", "detail": str(exc)[:200]})
+            except OSError:
+                pass
+            return
+
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
@@ -337,10 +613,15 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._read_json()
                 sid = body.get("session_id") or uuid.uuid4().hex[:16]
                 state = SESSION_STORE.create_or_get(sid)
+                talker = resolve_talker_provider()
                 ws_base = default_talker_ws_path()
                 self._send(200, {
                     "session_id": state.session_id,
-                    "talker": TALKER_PROVIDER,
+                    "talker": talker,
+                    "talker_requested": TALKER_PROVIDER_REQUESTED,
+                    "input_audio_sample_rate": talker_input_sample_rate(talker),
+                    "interruption_handling_enabled": interruption_handling_enabled(),
+                    "duplex_experiment": duplex_experiment_config(talker),
                     "ws_url": f"{ws_base}?session_id={state.session_id}",
                 })
             elif path == "/api/v1/image":
@@ -374,42 +655,68 @@ class Handler(BaseHTTPRequestHandler):
                 with open(stored_path, "wb") as fh:
                     fh.write(image_bytes)
 
-                analysis = describe_shopping_image(
-                    image_bytes,
-                    mime_type=mime_type,
-                    filename=filename,
-                    user_text=body.get("user_text") or state.preference.raw_query,
-                )
-                visual_text = visual_context_text(analysis)
-                prior = state.preference
-                updated = extract_preference(visual_text, prior)
-                updated.visual_context = visual_text
-                if visual_text and all(visual_text.lower() not in s.lower() for s in updated.soft):
-                    updated.soft.append(f"Image reference: {visual_text[:160]}")
-                if prior.raw_query and prior.raw_query not in updated.raw_query:
-                    updated.raw_query = f"{prior.raw_query} {visual_text}".strip()
-                SESSION_STORE.update_preference(sid, updated)
+                # --- TEST MODE: image AI vision analysis DISABLED ---
+                # The Qwen-VL keyword extraction is commented out on purpose so
+                # we can verify the /text multimodal path: with no visual_context
+                # / search_keywords written here, any image-derived signal in the
+                # final brief can ONLY come from the image being fed directly into
+                # the analysis LLM at /text. We still SAVE the file + register the
+                # image_ref (path/mime_type) so _session_image_data_urls picks it
+                # up for the multimodal call.
+                # analysis = describe_shopping_image(
+                #     image_bytes,
+                #     mime_type=mime_type,
+                #     filename=filename,
+                #     user_text=body.get("user_text") or state.preference.raw_query,
+                # )
+                # visual_text = visual_context_text(analysis)
+                # prior = state.preference
+                # updated = extract_preference(visual_text, prior)
+                # updated.visual_context = visual_text
+                # img_keywords = analysis.get("search_keywords")
+                # if isinstance(img_keywords, list) and img_keywords:
+                #     updated.search_keywords = [str(k).strip() for k in img_keywords if str(k).strip()][:6]
+                # if analysis.get("product_category") and not updated.category:
+                #     cat = str(analysis["product_category"]).strip()
+                #     if cat.isascii():
+                #         updated.category = cat
+                # if visual_text and all(visual_text.lower() not in s.lower() for s in updated.soft):
+                #     updated.soft.append(f"Image reference: {visual_text[:160]}")
+                # if prior.raw_query and prior.raw_query not in updated.raw_query:
+                #     updated.raw_query = f"{prior.raw_query} {visual_text}".strip()
+                # SESSION_STORE.update_preference(sid, updated)
                 SESSION_STORE.add_image_ref(sid, {
                     "image_id": image_id,
                     "filename": filename,
                     "mime_type": mime_type,
                     "path": stored_path,
-                    "summary": str(analysis.get("summary") or "")[:240],
+                    "summary": "",
                 })
-                SESSION_STORE.append_turn(sid, "user", f"[image] {visual_text}")
-                LOG_STORE.log_conversation(sid, "user", f"[image] {visual_text}")
-                LOG_STORE.log_trace(sid, "vision", "image_analyzed", {
+                SESSION_STORE.append_turn(sid, "user", "[image uploaded]")
+                LOG_STORE.log_conversation(sid, "user", "[image uploaded]")
+                LOG_STORE.log_trace(sid, "vision", "image_stored_no_analysis", {
                     "image_id": image_id,
                     "filename": filename,
-                    "analysis": analysis,
+                    "note": "vision analysis disabled for multimodal test",
                 })
                 self._send(200, {
                     "session_id": sid,
                     "image_id": image_id,
-                    "visual_context": visual_text,
-                    "analysis": analysis,
-                    "preference": updated.to_dict(),
+                    "visual_context": "",
+                    "analysis": {"provider": "disabled", "note": "vision analysis commented out for test"},
+                    "preference": state.preference.to_dict(),
                 })
+            elif path.startswith("/api/v1/session/") and path.endswith("/analyze_stream"):
+                sid = path[len("/api/v1/session/"):-len("/analyze_stream")].strip("/")
+                body = self._read_json()
+                text = (body.get("text") or "").strip()
+                if not sid:
+                    self._send(400, {"error": "missing_session_id"})
+                    return
+                if len(text) < 2:
+                    self._send(400, {"error": "empty_text"})
+                    return
+                self._stream_analyze(sid, text)
             elif path.startswith("/api/v1/session/") and path.endswith("/text"):
                 sid = path[len("/api/v1/session/"):-len("/text")].strip("/")
                 body = self._read_json()
@@ -431,10 +738,24 @@ class Handler(BaseHTTPRequestHandler):
                 updated = extract_preference(combined_text, state.preference)
                 if state.preference.visual_context and not updated.visual_context:
                     updated.visual_context = state.preference.visual_context
+
+                # Every text (incl. transcribed voice) is analyzed by the LLM.
+                # If the session has uploaded image(s), send them together with
+                # the text as one multimodal turn (image is real input, not just
+                # pre-extracted keywords).
+                session_images = _session_image_data_urls(state)
+                analysis = analyze_need(
+                    text, prior=state.preference.to_dict(), images=session_images
+                )
+                if analysis.get("provider") == "qwen":
+                    _merge_llm_analysis(updated, analysis)
+
                 SESSION_STORE.update_preference(sid, updated)
                 SESSION_STORE.append_turn(sid, "user", text)
                 LOG_STORE.log_conversation(sid, "user", text)
-                LOG_STORE.log_trace(sid, "text", "intent_updated", updated.to_dict())
+                LOG_STORE.log_trace(sid, "text", "intent_updated", {
+                    **updated.to_dict(), "llm_provider": analysis.get("provider"),
+                })
                 EVENT_BUS.emit(Event(
                     type=EventType.USER_INTENT_UPDATED,
                     session_id=sid,
@@ -444,6 +765,7 @@ class Handler(BaseHTTPRequestHandler):
                     "session_id": sid,
                     "preference": updated.to_dict(),
                     "visual_context": updated.visual_context,
+                    "analysis": analysis,
                 })
             else:
                 self._send(404, {"error": "unknown_endpoint", "path": path})
@@ -467,7 +789,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif path.endswith("/qwen/realtime/ws"):
                     provider = "qwen"
                 else:
-                    provider = TALKER_PROVIDER
+                    provider = TALKER_PROVIDER_REQUESTED
                 self._handle_realtime_ws(sid, provider=provider)
                 return
             self._send(400, {"error": "websocket_upgrade_required"})
@@ -480,12 +802,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {
                     "status": "ok",
                     "count": count(),
-                    "talker": TALKER_PROVIDER,
+                    "talker": resolve_talker_provider(),
+                    "talker_requested": TALKER_PROVIDER_REQUESTED,
                     "qwen_key_configured": bool(DASHSCOPE_API_KEY),
                     "openai_key_configured": bool(OPENAI_API_KEY),
+                    "openai_model": REALTIME_MODEL,
                     "realtime_ws": default_talker_ws_path(),
                     "qwen_ws": "/api/v1/qwen/realtime/ws",
                     "openai_ws": "/api/v1/openai/realtime/ws",
+                    "duplex_experiment": duplex_experiment_config(),
                     "engine": "talker-worker",
                     "llm": "qwen",
                     "voice_test": "/voice-test",
@@ -495,17 +820,24 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/v1/realtime/token":
                 self._send(200, mint_realtime_token())
             elif path == "/api/v1/realtime/check":
+                talker = resolve_talker_provider()
                 self._send(200, {
                     "status": "ok",
-                    "talker": TALKER_PROVIDER,
+                    "talker": talker,
+                    "talker_requested": TALKER_PROVIDER_REQUESTED,
                     "qwen_key_configured": bool(DASHSCOPE_API_KEY),
                     "qwen_model": QWEN_OMNI_MODEL,
+                    "openai_key_configured": bool(OPENAI_API_KEY),
+                    "openai_model": REALTIME_MODEL,
+                    "input_audio_sample_rate": talker_input_sample_rate(talker),
+                    "interruption_handling_enabled": interruption_handling_enabled(),
+                    "duplex_experiment": duplex_experiment_config(talker),
                     "qwen_realtime_url": os.environ.get(
                         "QWEN_REALTIME_URL",
                         "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
                     ),
                     "ws_url": default_talker_ws_path(),
-                    "note": "This checks local backend configuration only; WebSocket still needs outbound network access to Qwen.",
+                    "note": "This checks local backend configuration only; WebSocket still needs outbound network access to the selected realtime provider.",
                 })
             elif path.startswith("/api/v1/session/") and path.endswith("/recommendations"):
                 sid = path[len("/api/v1/session/"):-len("/recommendations")].strip("/")
@@ -545,7 +877,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "missing_sec_websocket_key"})
             return
 
-        provider = (provider or "qwen").strip().lower()
+        requested_provider = (provider or "auto").strip().lower()
+        provider = resolve_talker_provider(requested_provider)
+        experiment_logger = ExperimentEventLogger(DUPLEX_EXPERIMENT_LOG_DIR)
+        denoiser = None
+        local_vad_gate: LocalRealtimeVadGate | None = None
+        half_duplex_gate: HalfDuplexMicGate | None = None
         if provider == "openai":
             if not OPENAI_API_KEY:
                 self._send(500, {"error": "OPENAI_API_KEY not configured"})
@@ -563,12 +900,47 @@ class Handler(BaseHTTPRequestHandler):
             )
             upstream_error = "qwen_upstream_failed"
 
+        if local_vad_requested():
+            try:
+                local_vad_gate = LocalRealtimeVadGate(
+                    input_sample_rate=talker_input_sample_rate(provider),
+                )
+                print(f"[local-vad] enabled for {provider} Realtime input")
+            except Exception as exc:  # noqa: BLE001
+                local_vad_gate = None
+                print(f"[local-vad] unavailable, falling back to {provider} server_vad: {exc}")
+
         SESSION_STORE.require(session_id)
+        if talker_denoise_requested():
+            try:
+                denoiser = build_talker_denoiser(talker_input_sample_rate(provider))
+                print(f"[denoise] enabled provider={provider}")
+            except Exception as exc:  # noqa: BLE001
+                denoiser = None
+                print(f"[denoise] unavailable, forwarding raw audio: {exc}")
+        if half_duplex_mic_gate_requested():
+            half_duplex_gate = HalfDuplexMicGate(
+                session_id=session_id,
+                input_sample_rate=talker_input_sample_rate(provider),
+                logger=experiment_logger,
+            )
+            print("[duplex-exp] half-duplex mic gate enabled")
         bridge = TalkerBridge(
             session_id, EVENT_BUS, SESSION_STORE, LOG_STORE, protocol=protocol
         )
 
         print(f"[ws] upgrade provider={provider} session={session_id} from {self.address_string()}")
+        experiment_logger.log(
+            session_id=session_id,
+            action="ws_open",
+            detail={
+                **duplex_experiment_config(provider),
+                "provider": provider,
+                "protocol": protocol,
+                "input_sample_rate": talker_input_sample_rate(provider),
+                "output_sample_rate": 24_000 if provider in ("openai", "qwen") else None,
+            },
+        )
         try:
             upstream = connect_fn()
         except Exception as exc:
@@ -590,6 +962,8 @@ class Handler(BaseHTTPRequestHandler):
             bridge.bind_sender(sender.send_json)
             if provider == "qwen":
                 update = default_omni_session_update(SHOPPING_INSTRUCTIONS)
+                if local_vad_gate is not None:
+                    update.setdefault("session", {})["turn_detection"] = None
                 # Force voice from current env / .env (never leave stale Cherry).
                 voice = (os.environ.get("QWEN_OMNI_VOICE") or "Tina").strip() or "Tina"
                 if voice.lower() == "cherry" and "3.5" in QWEN_OMNI_MODEL:
@@ -598,29 +972,154 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[ws] session.update voice={voice} model={QWEN_OMNI_MODEL}")
                 sender.send_json(update)
             else:
+                turn_detection = None
+                if local_vad_gate is None:
+                    turn_detection = {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
+                        "create_response": True,
+                    }
                 sender.send_json({
                     "type": "session.update",
                     "session": {
                         "type": "realtime",
-                        "instructions": SHOPPING_INSTRUCTIONS,
                         "output_modalities": ["audio"],
+                        "voice": OPENAI_REALTIME_VOICE,
+                        "instructions": SHOPPING_INSTRUCTIONS,
+                        "input_audio_format": "pcm16",
+                        "output_audio_format": "pcm16",
+                        "input_audio_transcription": {
+                            "model": OPENAI_TRANSCRIBE_MODEL,
+                            "language": "en",
+                        },
+                        "turn_detection": turn_detection,
                     },
                 })
+            experiment_logger.log(
+                session_id=session_id,
+                action="session_update_sent",
+                detail=duplex_experiment_config(provider),
+            )
+
+        def handle_client_text(text: str) -> None | str | list[str]:
+            experiment_logger.log_frame(session_id=session_id, direction="client", text=text)
+            frames = [text]
+            if denoiser is not None:
+                denoised_frames: list[str] = []
+                for frame_text in frames:
+                    transformed = denoiser.process_client_text(frame_text)
+                    if transformed is None:
+                        denoised_frames.append(frame_text)
+                    else:
+                        denoised_frames.extend(transformed)
+                frames = denoised_frames
+                if not frames:
+                    return []
+            if half_duplex_gate is not None:
+                gated_frames: list[str] = []
+                for frame_text in frames:
+                    transformed = half_duplex_gate.process_client_text(frame_text)
+                    if transformed is None:
+                        gated_frames.append(frame_text)
+                    elif isinstance(transformed, str):
+                        gated_frames.append(transformed)
+                    else:
+                        gated_frames.extend(transformed)
+                frames = gated_frames
+                if not frames:
+                    return []
+            if local_vad_gate is not None:
+                vad_frames: list[str] = []
+                local_vad_changed = False
+                for frame_text in frames:
+                    bridge.on_client_text(frame_text)
+                    transformed = local_vad_gate.process_client_text(frame_text)
+                    if transformed is None:
+                        vad_frames.append(frame_text)
+                    else:
+                        if local_vad_gate.consume_barge_in_cancel_pending():
+                            bridge.record_local_barge_in_cancel(
+                                source={
+                                    "type": "local_vad_barge_in",
+                                    "protocol": protocol,
+                                }
+                            )
+                        local_vad_changed = True
+                        experiment_logger.log(
+                            session_id=session_id,
+                            action="local_vad_transform",
+                            detail=_summarize_transformed_frames(frame_text, transformed),
+                        )
+                        vad_frames.extend(transformed)
+                if local_vad_changed:
+                    return vad_frames
+                return None if vad_frames == [text] else vad_frames
+            for frame_text in frames:
+                bridge.on_client_text(frame_text)
+            return None if frames == [text] else frames
+
+        def handle_upstream_text(text: str) -> None:
+            experiment_logger.log_frame(session_id=session_id, direction="server", text=text)
+            if half_duplex_gate is not None:
+                half_duplex_gate.process_upstream_text(text)
+            if local_vad_gate is not None:
+                local_vad_gate.process_upstream_text(text)
+            bridge.on_upstream_text(text)
 
         try:
             relay_sockets(
                 client,
                 upstream,
                 on_log=lambda m: print(f"[ws:{provider}:{session_id[:8]}] {m}"),
-                on_client_text=bridge.on_client_text,
-                on_upstream_text=bridge.on_upstream_text,
+                on_client_text=handle_client_text,
+                on_upstream_text=handle_upstream_text,
                 on_ready=on_ready,
             )
         finally:
+            experiment_logger.log(
+                session_id=session_id,
+                action="ws_close",
+                detail={"provider": provider},
+            )
             print(f"[ws] session closed provider={provider} id={session_id}")
 
     def log_message(self, fmt: str, *args) -> None:
         print(f"[req] {self.address_string()} {fmt % args}")
+
+
+def _summarize_transformed_frames(input_text: str, frames: list[str]) -> dict:
+    try:
+        input_frame = json.loads(input_text)
+    except json.JSONDecodeError:
+        input_type = "invalid_json"
+    else:
+        input_type = input_frame.get("type")
+
+    output_types: dict[str, int] = {}
+    output_audio_bytes = 0
+    for raw in frames:
+        try:
+            frame = json.loads(raw)
+        except json.JSONDecodeError:
+            output_types["invalid_json"] = output_types.get("invalid_json", 0) + 1
+            continue
+        frame_type = str(frame.get("type") or "")
+        output_types[frame_type] = output_types.get(frame_type, 0) + 1
+        if frame_type == "input_audio_buffer.append":
+            audio = frame.get("audio")
+            if isinstance(audio, str) and audio:
+                try:
+                    output_audio_bytes += len(base64.b64decode(audio, validate=False))
+                except Exception:
+                    pass
+    return {
+        "input_type": input_type,
+        "output_frame_count": len(frames),
+        "output_types": output_types,
+        "output_audio_bytes": output_audio_bytes,
+    }
 
 
 def main() -> None:
@@ -644,15 +1143,20 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"VoiceShop++ backend serving {total} laptops")
     print(f"Listening on http://{args.host}:{args.port}  (db={DB_PATH})")
-    print(f"Talker provider: {TALKER_PROVIDER}  (LLM agents: Qwen)")
+    print(
+        f"Talker provider: {resolve_talker_provider()} "
+        f"(requested={TALKER_PROVIDER_REQUESTED}; LLM agents: Qwen)"
+    )
     print("Engine: Talker + Worker(Planner→Search→Recommend)")
     print("REST: /api/v1/session  /api/v1/session/{id}/recommendations")
     print(f"WS default: {default_talker_ws_path()}?session_id=...")
     print("WS Qwen:    /api/v1/qwen/realtime/ws")
-    print("WS OpenAI:  /api/v1/openai/realtime/ws  (legacy)")
+    print("WS OpenAI:  /api/v1/openai/realtime/ws")
     print("PC voice:   http://127.0.0.1:%s/voice-test" % args.port)
     if os.path.isfile(ENV_FILE):
         print(f"Loaded local secrets from {ENV_FILE}")
+    if os.path.isfile(FALLBACK_OPENAI_ENV_FILE):
+        print(f"Loaded fallback OpenAI secrets from {FALLBACK_OPENAI_ENV_FILE}")
     if DASHSCOPE_API_KEY:
         print(f"Qwen Omni enabled (model={QWEN_OMNI_MODEL}, voice={QWEN_OMNI_VOICE})")
     else:

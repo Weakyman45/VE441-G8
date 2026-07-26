@@ -10,11 +10,12 @@ import socket
 import ssl
 import struct
 import threading
-from typing import Callable
+from typing import Callable, Optional, Union
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-TextHook = Callable[[str], None]
+TextHook = Callable[[str], Optional[Union[str, list[str]]]]
 
 
 def ws_accept_key(sec_key: str) -> str:
@@ -124,15 +125,23 @@ def _tcp_via_proxy_or_direct(host: str, port: int, timeout: float) -> socket.soc
 
 
 def connect_openai_realtime(api_key: str, model: str, timeout: float = 25.0) -> ssl.SSLSocket:
-    host = "api.openai.com"
-    path = f"/v1/realtime?model={model}"
-    raw = _tcp_via_proxy_or_direct(host, 443, timeout)
+    base_url = os.environ.get("OPENAI_REALTIME_WS_BASE_URL", "wss://api.openai.com/v1/realtime").strip()
+    parsed = urlparse(base_url)
+    if parsed.scheme != "wss" or not parsed.hostname:
+        raise ValueError(f"OPENAI_REALTIME_WS_BASE_URL must be a wss URL, got {base_url!r}")
+    host = parsed.hostname
+    port = parsed.port or 443
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["model"] = model
+    path = parsed.path or "/v1/realtime"
+    path = f"{path}?{urlencode(query)}"
+    raw = _tcp_via_proxy_or_direct(host, port, timeout)
     ctx = ssl.create_default_context()
     ssock = ctx.wrap_socket(raw, server_hostname=host)
     sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
     req = (
         f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
+        f"Host: {host}:{port}\r\n"
         f"Upgrade: websocket\r\n"
         f"Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {sec_key}\r\n"
@@ -216,18 +225,29 @@ def relay_sockets(
                 if opcode == 0xA:
                     continue
                 if opcode in (0x1, 0x2, 0x0):
+                    transformed: None | str | list[str] = None
                     if opcode == 0x1:
                         try:
                             text = payload.decode("utf-8")
                             if to_upstream and on_client_text:
-                                on_client_text(text)
+                                transformed = on_client_text(text)
                             if not to_upstream and on_upstream_text:
                                 on_upstream_text(text)
                         except Exception as hook_exc:
                             log(f"hook error ({name}): {hook_exc}")
+                            transformed = None
                     if to_upstream:
+                        outbound_payloads: list[bytes]
+                        if opcode == 0x1 and transformed is not None:
+                            if isinstance(transformed, str):
+                                outbound_payloads = [transformed.encode("utf-8")] if transformed else []
+                            else:
+                                outbound_payloads = [item.encode("utf-8") for item in transformed if item]
+                        else:
+                            outbound_payloads = [payload]
                         with write_lock:
-                            write_frame(dst, opcode, payload, mask=True)
+                            for outbound in outbound_payloads:
+                                write_frame(dst, opcode, outbound, mask=True)
                     else:
                         write_frame(dst, opcode, payload, mask=False)
         except Exception as exc:

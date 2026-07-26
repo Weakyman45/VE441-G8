@@ -6,7 +6,7 @@ from typing import Any
 
 @dataclass
 class PreferenceProfile:
-    category: str = "laptop"
+    category: str = ""
     budget: int | None = None
     use_case: str = ""
     platform: str = "No preference"  # No preference | Windows | macOS
@@ -15,6 +15,9 @@ class PreferenceProfile:
     soft: list[str] = field(default_factory=list)
     visual_context: str = ""
     raw_query: str = ""
+    # English keywords for matching the (English) product catalog. Filled by the
+    # LLM brief so a Chinese/voice request still yields catalog-searchable terms.
+    search_keywords: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -33,6 +36,7 @@ class RankedProduct:
     display: str = ""
     performance: str = ""
     weight_kg: float = 0.0
+    image_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -80,6 +84,8 @@ class SessionState:
     worker: WorkerState = field(default_factory=WorkerState)
     image_refs: list[dict[str, str]] = field(default_factory=list)
     memory_summary: str = ""
+    risk_category: str = "normal"
+    risk_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,4 +95,6 @@ class SessionState:
             "worker": self.worker.to_dict(),
             "image_refs": self.image_refs[-10:],
             "memory_summary": self.memory_summary,
+            "risk_category": self.risk_category,
+            "risk_reasons": self.risk_reasons[-5:],
         }

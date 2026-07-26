@@ -10,6 +10,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
@@ -32,6 +33,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.view.WindowInsetsController
 import android.view.inputmethod.EditorInfo
 import android.widget.CheckBox
@@ -87,7 +89,8 @@ class MainActivity : Activity() {
         val reasons: List<String>,
         val tradeOffs: List<String>,
         val color: Int,
-        val platform: String = "Windows"
+        val platform: String = "Windows",
+        val imageUrl: String = ""
     )
 
     private val ink = Color.rgb(30, 39, 50)
@@ -177,6 +180,17 @@ class MainActivity : Activity() {
     private var catalogSource: String = "Built-in demo (${fallbackLaptops.size}) - loading…"
     private val catalogExecutor = Executors.newSingleThreadExecutor()
 
+    // Combine the typed need with image-derived keywords/category so the photo
+    // actually influences the catalog search. Keywords go first so they land
+    // within the backend's first-N search tokens.
+    private fun buildSearchQuery(): String {
+        val parts = ArrayList<String>()
+        parts.addAll(imageSearchKeywords)
+        if (imageCategory.isNotBlank()) parts.add(imageCategory)
+        shoppingNeed.trim().takeIf { it.isNotBlank() }?.let { parts.add(it) }
+        return parts.joinToString(" ").trim()
+    }
+
     private fun loadCatalogAsync(query: String) {
         catalogExecutor.execute {
             val loaded = runCatching { fetchCatalog(query) }.getOrElse { error ->
@@ -187,7 +201,7 @@ class MainActivity : Activity() {
                 if (isDestroyed) return@post
                 if (loaded.isNotEmpty()) {
                     laptops = loaded
-                    catalogSource = "Backend: ${loaded.size} laptops (q=\"$query\")"
+                    catalogSource = "Backend: ${loaded.size} products (q=\"$query\")"
                     Log.i("VoiceShop", catalogSource)
                 } else {
                     catalogSource = "Built-in demo (${fallbackLaptops.size}) - backend unreachable at $BACKEND_BASE_URL"
@@ -228,7 +242,7 @@ class MainActivity : Activity() {
         val reviewCount = if (ratingNumber > 0) "%,d reviews".format(Locale.US, ratingNumber) else "No reviews yet"
         return Laptop(
             id = obj.optString("id").ifBlank { "item$index" },
-            name = obj.optString("name").ifBlank { "Unnamed laptop" },
+            name = obj.optString("name").ifBlank { "Unnamed product" },
             price = obj.optInt("price", 0),
             match = (rating / 5.0 * 100).toInt().coerceIn(60, 99),
             rating = rating,
@@ -237,13 +251,14 @@ class MainActivity : Activity() {
             performance = obj.optString("performance").orEmptyText(),
             battery = obj.optString("battery").orEmptyText(),
             weightKg = obj.optDouble("weight_kg", 0.0),
-            summary = obj.optString("summary").ifNullOrBlank { "Laptop option${if (store.isNotBlank()) " from $store" else ""}" },
+            summary = obj.optString("summary").ifNullOrBlank { "Product option${if (store.isNotBlank()) " from $store" else ""}" },
             reviewSentiment = obj.optString("review_sentiment").ifNullOrBlank { "No aggregated review summary available." },
             weakness = obj.optString("weakness").ifNullOrBlank { "No notable weaknesses in the catalog data." },
-            reasons = jsonArrayToList(obj.optJSONArray("reasons")).ifEmpty { listOf("Matches your laptop search") },
+            reasons = jsonArrayToList(obj.optJSONArray("reasons")).ifEmpty { listOf("Matches your search") },
             tradeOffs = jsonArrayToList(obj.optJSONArray("trade_offs")).ifEmpty { listOf("Limited spec detail available for this item.") },
             color = catalogColors[index % catalogColors.size],
-            platform = obj.optString("platform").ifNullOrBlank { "Windows" }
+            platform = obj.optString("platform").ifNullOrBlank { "Windows" },
+            imageUrl = obj.optString("image_url").trim()
         )
     }
 
@@ -267,7 +282,22 @@ class MainActivity : Activity() {
     private var selectedImageName: String? = null
     private var imageStyleSignal: String? = null
     private var uploadedImageId: String? = null
+    // Concise, catalog-friendly keywords + category extracted from the image,
+    // combined into the search query so results actually reflect the photo.
+    private var imageSearchKeywords: List<String> = emptyList()
+    private var imageCategory: String = ""
+    // Product category the AI inferred for the current need (e.g. "运动鞋",
+    // "coffee machine"). Drives which category-specific UI (specs, filters,
+    // choices, icon) is shown so the app is not hardcoded to laptops.
+    private var productCategory: String = ""
     private var imageUploadInFlight = false
+    // Which engine produced the current analysis: "qwen"/"qwen-vl" (real LLM),
+    // "fallback" (LLM unavailable → local rules), or null (not analyzed yet).
+    private var imageLlmProvider: String? = null
+    private var needLlmProvider: String? = null
+    // Budget number extracted by the backend LLM (source of truth when the
+    // must-have text carries no parseable number). null = unknown.
+    private var analyzedBudget: Int? = null
     private var voiceTarget = VoiceTarget.NEED
     private val mustHaves = mutableListOf("Budget up to ¥7,000", "Design-studio use", "Strong display", "16GB RAM preferred")
     private val preferences = mutableListOf("Portable for campus", "Long battery life", "Silver or neutral style")
@@ -279,12 +309,21 @@ class MainActivity : Activity() {
     private var filterUnderBudget = true
     private var filterOled = false
     private var filterPortable = false
+    private var filterTopRated = false
     private var detailProductId = "nova"
     private var detailOrigin = Stage.RECOMMEND
     private var chosenProductId: String? = null
     private var finalConfirmed = false
     private var analysisProgress = 0
     private var analysisPaused = false
+    // API-generated conversation summary shown on the "shopping brief" (CONTEXT) page.
+    private var briefAnalysisText = ""
+    private var briefAnalyzing = false
+    private var briefAnalysisPaused = false
+    private var briefAnalysisDone = false
+    private var briefExtraInput = ""
+    @Volatile private var briefAnalysisRun = 0
+    private var briefAnalysisConn: HttpURLConnection? = null
     private val scrollPositions = mutableMapOf<Stage, Int>()
     private var currentScrollView: ScrollView? = null
     private var currentScrollStage = Stage.EXPRESS
@@ -314,11 +353,21 @@ class MainActivity : Activity() {
     private var realtime: RealtimeSession? = null
     private var audioCapture: AudioCapture? = null
     private var audioPlayer: AudioPlayer? = null
+    // One-shot voice-to-text recording (backend ASR API), separate from the
+    // realtime duplex call above.
+    private var voiceRecordCapture: AudioCapture? = null
+    private var voiceRecordBuffer: ByteArrayOutputStream? = null
+    private var voiceRecordDialog: AlertDialog? = null
+    // Action to run once RECORD_AUDIO permission is granted (mic is used by both
+    // the realtime call and the one-shot voice-to-text recorder).
+    private var pendingMicAction: (() -> Unit)? = null
     private var gptConnected = false
     private var gptConnecting = false
     private var gptListening = false
     private var gptSpeaking = false
     private var engineSessionId: String? = null
+    private var realtimeTalkerProvider = "qwen"
+    private var realtimeInputSampleRate = AudioCapture.QWEN_SAMPLE_RATE
     private var lastWorkerPlanId: String? = null
     private val chatLines = mutableListOf<String>()
     private var streamingAssistant = ""
@@ -328,15 +377,26 @@ class MainActivity : Activity() {
     private val streamingRenderTick = Runnable {
         if (stage == Stage.EXPRESS) render()
     }
+    private class SessionGoneException : Exception()
+
     private val recommendationPollTick = object : Runnable {
         override fun run() {
             val sid = engineSessionId
             if (sid.isNullOrBlank()) return
             catalogExecutor.execute {
-                val bundle = runCatching { fetchWorkerRecommendations(sid) }.getOrNull()
+                val result = runCatching { fetchWorkerRecommendations(sid) }
                 handler.post {
-                    if (isDestroyed || engineSessionId.isNullOrBlank()) return@post
-                    if (bundle != null) applyWorkerBundle(bundle)
+                    if (isDestroyed) return@post
+                    if (result.exceptionOrNull() is SessionGoneException) {
+                        // Backend restarted / session expired: drop the dead id and
+                        // re-run the analysis so a fresh session + Worker search runs.
+                        engineSessionId = null
+                        stopRecommendationPolling()
+                        if (shoppingNeed.isNotBlank()) startBriefAnalysis(restart = true)
+                        return@post
+                    }
+                    if (engineSessionId.isNullOrBlank()) return@post
+                    result.getOrNull()?.let { applyWorkerBundle(it) }
                     handler.postDelayed(this, 2500L)
                 }
             }
@@ -350,8 +410,9 @@ class MainActivity : Activity() {
         window.navigationBarColor = Color.WHITE
         Log.i("VoiceShop", "Catalog init: $catalogSource")
         render()
-        loadCatalogAsync(if (shoppingNeed.isBlank()) "laptop" else shoppingNeed)
-        selectedImageUri?.takeIf { imageStyleSignal == null }?.let { analyzeImageStyleAsync(Uri.parse(it)) }
+        loadCatalogAsync(buildSearchQuery().ifBlank { "laptop" })
+        // Local image style analysis disabled — image goes to the LLM with text.
+        // selectedImageUri?.takeIf { imageStyleSignal == null }?.let { analyzeImageStyleAsync(Uri.parse(it)) }
         window.insetsController?.setSystemBarsAppearance(
             WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,
             WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
@@ -375,6 +436,8 @@ class MainActivity : Activity() {
         outState.putBoolean("budget", filterUnderBudget)
         outState.putBoolean("oled", filterOled)
         outState.putBoolean("portable", filterPortable)
+        outState.putBoolean("topRated", filterTopRated)
+        outState.putString("productCategory", productCategory)
         outState.putString("detail", detailProductId)
         outState.putString("detailOrigin", detailOrigin.name)
         outState.putString("voiceTarget", voiceTarget.name)
@@ -403,6 +466,8 @@ class MainActivity : Activity() {
         filterUnderBudget = state.getBoolean("budget", true)
         filterOled = state.getBoolean("oled", false)
         filterPortable = state.getBoolean("portable", false)
+        filterTopRated = state.getBoolean("topRated", false)
+        productCategory = state.getString("productCategory", "")
         detailProductId = state.getString("detail", "nova")
         detailOrigin = runCatching { Stage.valueOf(state.getString("detailOrigin") ?: "RECOMMEND") }.getOrDefault(Stage.RECOMMEND)
         voiceTarget = runCatching { VoiceTarget.valueOf(state.getString("voiceTarget") ?: "NEED") }.getOrDefault(VoiceTarget.NEED)
@@ -436,8 +501,15 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        briefAnalysisRun++
+        briefAnalysisConn?.let { conn -> runCatching { conn.disconnect() } }
+        briefAnalysisConn = null
         leaveDuplexAudioMode()
         stopGptVoiceCapture()
+        voiceRecordCapture?.stop()
+        voiceRecordCapture = null
+        voiceRecordDialog?.dismiss()
+        voiceRecordDialog = null
         audioPlayer?.release()
         audioPlayer = null
         realtime?.disconnect()
@@ -494,7 +566,7 @@ class MainActivity : Activity() {
 
     private fun expressScreen(): View = scrollColumn().apply {
         addView(card(paleYellow, Color.rgb(234, 194, 41)).apply {
-            addView(text("Find your next laptop", 22f, ink, Typeface.BOLD), fullWidth(bottom = dp(8)))
+            addView(text("Find what you need", 22f, ink, Typeface.BOLD), fullWidth(bottom = dp(8)))
             addView(text("Recommendations shaped around your budget, work, and preferences.", 13f, muted), fullWidth(bottom = dp(18)))
             addView(button("VOICE  Start with voice", primary = true) {
                 voiceTarget = VoiceTarget.NEED
@@ -510,7 +582,7 @@ class MainActivity : Activity() {
                 if (selectedImageUri == null) "+ Add Reference" else "Change Reference",
                 "Add product photo or screenshot"
             ) { launchImagePicker() }, LinearLayout.LayoutParams(0, dp(94), 1f).withMargins(right = dp(8)))
-            addView(entryCard("Design student preset", "¥7,000 • color-accurate display • portable") {
+            addView(entryCard("Try an example", "Tap to prefill a sample request") {
                 shoppingNeed = SAMPLE_NEED
                 render()
             }, LinearLayout.LayoutParams(0, dp(94), 1f))
@@ -523,7 +595,7 @@ class MainActivity : Activity() {
             val input = EditText(this@MainActivity).apply {
                 setText(shoppingNeed)
                 setSelection(text.length)
-                hint = "Budget, apps, screen, portability…"
+                hint = "Budget, brand, style, key features…"
                 setTextColor(ink)
                 setHintTextColor(muted)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -556,7 +628,7 @@ class MainActivity : Activity() {
                 gptConnecting -> "Starting call…"
                 gptConnected && gptSpeaking -> "In call — speak anytime to interrupt"
                 gptConnected -> "In call — listening"
-                else -> "Talk with the shopping assistant about your laptop needs."
+                else -> "Talk with the shopping assistant about what you want to buy."
             },
             12f,
             muted
@@ -629,10 +701,10 @@ class MainActivity : Activity() {
             addView(text(selectedImageName ?: "Design reference image", 12f, muted), fullWidth(bottom = dp(8)))
             addView(text(
                 when {
-                    imageUploadInFlight -> "Uploading to vision worker..."
-                    uploadedImageId != null && imageStyleSignal != null -> "LLM visual read: $imageStyleSignal"
-                    imageStyleSignal != null -> "Local visual read: $imageStyleSignal"
-                    else -> "Reading image..."
+                    imageUploadInFlight -> "正在上传图片…"
+                    imageLlmProvider == "error" -> "图片上传失败，可重试"
+                    uploadedImageId != null -> "已添加，将与文字一起交给大模型分析"
+                    else -> "准备中…"
                 },
                 12f,
                 blue,
@@ -643,6 +715,9 @@ class MainActivity : Activity() {
                 selectedImageName = null
                 imageStyleSignal = null
                 uploadedImageId = null
+                imageSearchKeywords = emptyList()
+                imageCategory = ""
+                imageLlmProvider = null
                 imageUploadInFlight = false
                 contextSignalChanged()
                 render()
@@ -655,11 +730,11 @@ class MainActivity : Activity() {
         addView(text("These preferences shape your matches.", 13f, muted), fullWidth(bottom = dp(14)))
         addView(card(paleBlue, Color.rgb(171, 210, 229)).apply {
             addView(text("Your request", 12f, blue, Typeface.BOLD), fullWidth(bottom = dp(6)))
-            addView(text(shoppingNeed.ifBlank { SAMPLE_NEED }, 14f, ink), fullWidth(bottom = if (selectedImageName != null) dp(8) else 0))
+            addView(text(shoppingNeed.ifBlank { "Describe what you want to buy — budget, brand, style, key features…" }, 14f, ink), fullWidth(bottom = if (selectedImageName != null) dp(8) else 0))
             selectedImageName?.let {
                 addView(text("Image: $it", 12f, muted), fullWidth(bottom = dp(4)))
                 addView(text(
-                    imageStyleSignal?.let { signal -> "Visual preference - $signal" } ?: "Reading image...",
+                    "将与文字一起交给大模型分析",
                     12f,
                     blue,
                     Typeface.BOLD
@@ -667,9 +742,15 @@ class MainActivity : Activity() {
             }
             addView(button("Edit request") { setStage(Stage.EXPRESS) }, fullWidth(top = dp(10)))
         }, fullWidth(bottom = dp(14)))
+        if (briefAnalyzing || briefAnalysisPaused || briefAnalysisDone || briefAnalysisText.isNotBlank()) {
+            addView(analysisProcessCard(), fullWidth(bottom = dp(14)))
+        }
         addView(requirementSection("Must-haves", mustHaves, paleYellow, "Add a must-have"), fullWidth(bottom = dp(14)))
         addView(requirementSection("Nice-to-haves", preferences, paleBlue, "Add a preference"), fullWidth(bottom = dp(14)))
-        addView(clarificationSection(), fullWidth(bottom = dp(14)))
+        // "Mac or Windows / touch" only makes sense for computers.
+        if (isComputerCategory()) {
+            addView(clarificationSection(), fullWidth(bottom = dp(14)))
+        }
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(button("Add by voice") {
@@ -678,9 +759,11 @@ class MainActivity : Activity() {
             }, LinearLayout.LayoutParams(0, dp(48), 1f).withMargins(right = dp(8)))
             addView(button(if (selectedImageUri == null) "Add reference" else "Change reference") { launchImagePicker() }, LinearLayout.LayoutParams(0, dp(48), 1f))
         }, fullWidth(bottom = dp(14)))
-        val imageReady = selectedImageUri == null || (!imageUploadInFlight && imageStyleSignal != null)
+        // Ready once the image has been uploaded to the backend (no on-device
+        // analysis anymore); the image is analyzed later together with the text.
+        val imageReady = selectedImageUri == null || (!imageUploadInFlight && uploadedImageId != null)
         addView(button(
-            if (imageReady) "Find matching laptops" else "Reading reference...",
+            if (imageReady) "Find matching products" else "Uploading reference...",
             primary = true,
             enabled = imageReady
         ) {
@@ -690,6 +773,81 @@ class MainActivity : Activity() {
                 setStage(Stage.REFINE)
             }
         })
+    }
+
+    private fun analysisProcessCard(): View = card(paleBlue, Color.rgb(171, 210, 229)).apply {
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(text("对话总结", 15f, ink, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+            val status = when {
+                briefAnalyzing -> "分析中"
+                briefAnalysisPaused -> "已暂停"
+                briefAnalysisDone -> "完成"
+                else -> ""
+            }
+            val statusColor = when {
+                briefAnalysisPaused -> accent
+                briefAnalysisDone -> green
+                else -> blue
+            }
+            if (status.isNotEmpty()) {
+                addView(text(status, 11f, statusColor, Typeface.BOLD).apply {
+                    gravity = Gravity.CENTER
+                    background = rect(surface, border, 1, 14)
+                    setPadding(dp(10), dp(5), dp(10), dp(5))
+                })
+            }
+        }, fullWidth(bottom = dp(10)))
+
+        val body = when {
+            briefAnalysisText.isNotBlank() -> briefAnalysisText
+            briefAnalyzing -> "正在请求 API 生成这段对话的总结…"
+            briefAnalysisPaused -> "已暂停。可在下面补充一句描述后继续。"
+            else -> "等待 API 返回这段对话的总结。"
+        }
+        addView(text(body, 13f, ink), fullWidth(bottom = dp(10)))
+
+        when {
+            briefAnalyzing -> {
+                addView(button("暂停并补充") { pauseBriefAnalysis() }, fullWidth())
+            }
+            briefAnalysisPaused -> {
+                val extra = EditText(this@MainActivity).apply {
+                    setText(briefExtraInput)
+                    setSelection(text.length)
+                    hint = "补充一句需求（可选），如：适合油皮、无香精"
+                    setTextColor(ink)
+                    setHintTextColor(muted)
+                    setSingleLine(true)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                    background = rect(Color.WHITE, border, 1, 9)
+                    setPadding(dp(12), 0, dp(12), 0)
+                    addTextChangedListener(watcher { briefExtraInput = it })
+                }
+                addView(extra, fullWidth(bottom = dp(8)).apply { height = dp(46) })
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(button("继续分析", primary = true) {
+                        val add = extra.text.toString().trim()
+                        if (add.isNotEmpty()) {
+                            shoppingNeed = (shoppingNeed.trim() + "。" + add).trim()
+                            briefExtraInput = ""
+                            loadCatalogAsync(buildSearchQuery())
+                        }
+                        startBriefAnalysis(restart = true)
+                    }, LinearLayout.LayoutParams(0, dp(46), 1f).withMargins(right = dp(8)))
+                    addView(button("跳过分析") {
+                        briefAnalysisPaused = false
+                        briefAnalysisDone = true
+                        render()
+                    }, LinearLayout.LayoutParams(0, dp(46), 1f))
+                })
+            }
+            briefAnalysisDone -> {
+                addView(button("重新分析") { startBriefAnalysis(restart = true) }, fullWidth())
+            }
+        }
     }
 
     private fun requirementSection(title: String, values: MutableList<String>, chipColor: Int, addHint: String): View {
@@ -772,7 +930,7 @@ class MainActivity : Activity() {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                addView(text(if (analysisPaused) "Search paused" else if (analysisProgress == analysisSteps.size) "${filteredLaptops().size} matches ready" else "Searching laptops", 15f, ink, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+                addView(text(if (analysisPaused) "Search paused" else if (analysisProgress == analysisSteps.size) "${filteredLaptops().size} matches ready" else "Searching products", 15f, ink, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
                 addView(text(if (analysisProgress == analysisSteps.size) "Ready" else if (analysisPaused) "Paused" else "Searching", 11f, if (analysisProgress == analysisSteps.size) green else blue, Typeface.BOLD).apply {
                     gravity = Gravity.CENTER
                     background = rect(if (analysisProgress == analysisSteps.size) paleGreen else paleBlue, border, 1, 14)
@@ -842,9 +1000,17 @@ class MainActivity : Activity() {
     }
 
     private fun recommendationScreen(): View = scrollColumn(left = dp(14), right = dp(14)).apply {
-        addView(text(if (shoppingNeed.isBlank()) "Explore laptops" else "Matches for you", 22f, ink, Typeface.BOLD), fullWidth(bottom = dp(4)))
+        val cat = categoryLabel()
         addView(text(
-            if (shoppingNeed.isBlank()) "Popular options for design work"
+            when {
+                shoppingNeed.isBlank() -> "Explore products"
+                cat.isNotBlank() -> "Matches for $cat"
+                else -> "Matches for you"
+            },
+            22f, ink, Typeface.BOLD
+        ), fullWidth(bottom = dp(4)))
+        addView(text(
+            if (shoppingNeed.isBlank()) "Popular options for you"
             else "${money(budgetLimit())} budget • ${mustHaves.size + preferences.size} active preferences",
             13f,
             muted
@@ -860,24 +1026,24 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             addView(text("${visible.size} ${if (visible.size == 1) "result" else "results"}", 14f, ink, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
             addView(text(
-                "${selectedIds.size} of 2 in compare${if (hiddenSelections > 0) " • $hiddenSelections hidden" else ""}",
+                "${selectedIds.size} of $MAX_COMPARE in compare${if (hiddenSelections > 0) " • $hiddenSelections hidden" else ""}",
                 13f,
-                if (selectedIds.size == 2) green else blue,
+                if (canCompare()) green else blue,
                 Typeface.BOLD
             ))
         }, fullWidth(bottom = dp(10)))
         if (visible.isEmpty()) {
             addView(card(surface).apply {
-                addView(text("No laptops match all active filters.", 14f, ink, Typeface.BOLD), fullWidth(bottom = dp(10)))
+                addView(text("No products match all active filters.", 14f, ink, Typeface.BOLD), fullWidth(bottom = dp(10)))
                 addView(button("Clear filters", primary = true) {
-                    filterUnderBudget = false; filterOled = false; filterPortable = false; render()
+                    filterUnderBudget = false; filterOled = false; filterPortable = false; filterTopRated = false; render()
                 })
             }, fullWidth(bottom = dp(12)))
         } else visible.forEach { addView(productCard(it), fullWidth(bottom = dp(10))) }
         addView(button(
-            if (selectedIds.size == 2) "Compare 2 laptops" else "Choose 2 to compare",
-            primary = selectedIds.size == 2,
-            enabled = selectedIds.size == 2
+            if (canCompare()) "Compare ${selectedIds.size} items" else "Choose 2+ to compare",
+            primary = canCompare(),
+            enabled = canCompare()
         ) { setStage(Stage.COMPARE) }, fullWidth(top = dp(4), bottom = dp(8)))
         addView(button("Edit needs") { beginRefinement() })
     }
@@ -900,26 +1066,57 @@ class MainActivity : Activity() {
             isChecked = filterUnderBudget
             setOnCheckedChangeListener { _, value -> filterUnderBudget = value; render() }
         })
+        // OLED / weight are laptop-specific — only offer them for computers.
+        if (isComputerCategory()) {
+            addView(CheckBox(this@MainActivity).apply {
+                text = "OLED display"
+                setTextColor(ink)
+                isChecked = filterOled
+                setOnCheckedChangeListener { _, value -> filterOled = value; render() }
+            })
+            addView(CheckBox(this@MainActivity).apply {
+                text = "Under 1.5 kg"
+                setTextColor(ink)
+                isChecked = filterPortable
+                setOnCheckedChangeListener { _, value -> filterPortable = value; render() }
+            })
+        }
         addView(CheckBox(this@MainActivity).apply {
-            text = "OLED display"
+            text = "Top rated (4.5+)"
             setTextColor(ink)
-            isChecked = filterOled
-            setOnCheckedChangeListener { _, value -> filterOled = value; render() }
-        })
-        addView(CheckBox(this@MainActivity).apply {
-            text = "Under 1.5 kg"
-            setTextColor(ink)
-            isChecked = filterPortable
-            setOnCheckedChangeListener { _, value -> filterPortable = value; render() }
+            isChecked = filterTopRated
+            setOnCheckedChangeListener { _, value -> filterTopRated = value; render() }
         })
     }
 
+    // True when the current need is about computers, so laptop-specific controls
+    // (OS choice, OLED/weight filters, Display/Performance specs) make sense.
+    private fun isComputerCategory(): Boolean {
+        val hay = (productCategory + " " + imageCategory + " " + shoppingNeed)
+            .lowercase(Locale.getDefault())
+        if (hay.isBlank()) return false
+        return listOf(
+            "laptop", "notebook", "macbook", "ultrabook", "chromebook", "computer",
+            "desktop", " pc", "tablet", "ipad", "笔记本", "电脑", "平板", "超极本"
+        ).any(hay::contains)
+    }
+
+    // A catalog string is worth showing only if the backend actually filled it.
+    private fun isSpecMeaningful(value: String?): Boolean =
+        !value.isNullOrBlank() && !value.equals("Not specified", ignoreCase = true)
+
+    // Short label for the current category, used in headers / empty states.
+    private fun categoryLabel(): String =
+        productCategory.ifBlank { imageCategory }.trim()
+
     private fun filteredLaptops(): List<Laptop> {
+        val computer = isComputerCategory()
         val filtered = laptops.filter { laptop ->
             (!filterUnderBudget || laptop.price <= budgetLimit()) &&
-                (!filterOled || laptop.display.contains("OLED")) &&
-                (!filterPortable || laptop.weightKg < 1.5) &&
-                (osPreference == "No preference" || laptop.platform == osPreference)
+                (!filterTopRated || laptop.rating >= 4.5) &&
+                (!(computer && filterOled) || laptop.display.contains("OLED")) &&
+                (!(computer && filterPortable) || laptop.weightKg < 1.5) &&
+                (!computer || osPreference == "No preference" || laptop.platform == osPreference)
         }
         return when (sortMode) {
             SortMode.MATCH -> filtered.sortedByDescending { matchScore(it) }
@@ -929,14 +1126,20 @@ class MainActivity : Activity() {
     }
 
     private fun budgetLimit(): Int {
-        val confirmedBudgets = budgetsIn(mustHaves.joinToString(" "))
-        return (confirmedBudgets.ifEmpty { budgetsIn(shoppingNeed) }).minOrNull() ?: 7_000
+        // 1) A number written in the must-haves is authoritative (user-editable).
+        budgetsIn(mustHaves.joinToString(" ")).minOrNull()?.let { return it }
+        // 2) Otherwise use the budget the backend LLM extracted from the request.
+        analyzedBudget?.let { return it }
+        // 3) Otherwise try the free-text request, else a permissive default.
+        return budgetsIn(shoppingNeed).minOrNull() ?: 7_000
     }
 
-    private fun budgetsIn(text: String): List<Int> = Regex("(?<!\\d)(\\d[\\d,]{3,5})(?!\\d)")
+    private fun budgetsIn(text: String): List<Int> = Regex("(?<!\\d)(\\d[\\d,]{1,6})(?!\\d)")
         .findAll(text)
         .mapNotNull { it.groupValues[1].replace(",", "").toIntOrNull() }
-        .filter { it in 3_000..50_000 }
+        // Generic catalog: budgets can be small (¥100 shoes) or large. Only drop
+        // clearly-not-a-price values. Do NOT cut off amounts under 3000 anymore.
+        .filter { it in 50..1_000_000 }
         .toList()
 
     private fun confirmedSignals(): List<String> = buildList {
@@ -944,7 +1147,8 @@ class MainActivity : Activity() {
         addAll(preferences)
         add("OS: $osPreference")
         add("Touch: $touchPreference")
-        imageStyleSignal?.let { add("Image style: $it") }
+        // Image style text removed — the image is analyzed multimodally by the LLM.
+        // imageStyleSignal?.let { add("Image style: $it") }
     }
 
     private fun deriveAssumptionsFromNeed() {
@@ -970,7 +1174,7 @@ class MainActivity : Activity() {
         if (listOf("portable", "lightweight", "campus", "commute").any(lower::contains) &&
             preferences.none { it.contains("portable", ignoreCase = true) || it.contains("light", ignoreCase = true) }
         ) {
-            preferences.add("Portable for campus")
+            preferences.add("Lightweight / portable")
         }
     }
 
@@ -1067,11 +1271,24 @@ class MainActivity : Activity() {
         }
     }
 
+    // Per-card spec line: laptop specs only for computers, and only when the
+    // catalog actually filled them. Non-computer categories (shoes, coffee…)
+    // have no structured specs here, so the line is omitted rather than showing
+    // "Display: Not specified / Performance: Not specified".
+    private fun cardSpecLine(product: Laptop): String? {
+        if (!isComputerCategory()) return null
+        val parts = buildList {
+            if (isSpecMeaningful(product.display)) add("Display: ${product.display}")
+            if (isSpecMeaningful(product.performance)) add("Performance: ${product.performance}")
+        }
+        return parts.joinToString("\n").ifBlank { null }
+    }
+
     private fun productCard(product: Laptop): View = card(if (selectedIds.contains(product.id)) paleYellow else Color.WHITE, if (selectedIds.contains(product.id)) accent else border).apply {
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.TOP
-            addView(LaptopPreviewView(this@MainActivity, product.color), LinearLayout.LayoutParams(dp(76), dp(70)).withMargins(right = dp(10)))
+            addView(ProductThumbView(this@MainActivity, product.color, isComputerCategory(), product.imageUrl), LinearLayout.LayoutParams(dp(76), dp(70)).withMargins(right = dp(10)))
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(text(product.name, 16f, ink, Typeface.BOLD), fullWidth(bottom = dp(3)))
@@ -1079,7 +1296,7 @@ class MainActivity : Activity() {
                 addView(text("${matchScore(product)}% match  •  ${product.summary}", 12f, green, Typeface.BOLD))
             }, LinearLayout.LayoutParams(0, -2, 1f))
         }, fullWidth(bottom = dp(8)))
-        addView(text("Display: ${product.display}\nPerformance: ${product.performance}", 12f, muted), fullWidth(bottom = dp(9)))
+        cardSpecLine(product)?.let { addView(text(it, 12f, muted), fullWidth(bottom = dp(9))) }
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1099,7 +1316,7 @@ class MainActivity : Activity() {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                addView(LaptopPreviewView(this@MainActivity, product.color), LinearLayout.LayoutParams(dp(104), dp(92)).withMargins(right = dp(14)))
+                addView(ProductThumbView(this@MainActivity, product.color, isComputerCategory(), product.imageUrl), LinearLayout.LayoutParams(dp(104), dp(92)).withMargins(right = dp(14)))
                 addView(LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.VERTICAL
                     addView(text(product.name, 20f, ink, Typeface.BOLD), fullWidth(bottom = dp(5)))
@@ -1114,13 +1331,19 @@ class MainActivity : Activity() {
             }, fullWidth(bottom = dp(12)))
             addView(card().apply {
                 addView(text("Product details", 16f, ink, Typeface.BOLD), fullWidth(bottom = dp(8)))
-                addView(detailRow("Platform", product.platform))
-                addView(detailRow("Display", product.display))
-                addView(detailRow("Performance", product.performance))
-                addView(detailRow("Battery", product.battery))
-                addView(detailRow("Weight", "${product.weightKg} kg"))
+                if (categoryLabel().isNotBlank()) addView(detailRow("Category", categoryLabel()))
+                if (isComputerCategory()) {
+                    addView(detailRow("Platform", product.platform))
+                    if (isSpecMeaningful(product.display)) addView(detailRow("Display", product.display))
+                    if (isSpecMeaningful(product.performance)) addView(detailRow("Performance", product.performance))
+                    if (isSpecMeaningful(product.battery)) addView(detailRow("Battery", product.battery))
+                    if (product.weightKg > 0.0) addView(detailRow("Weight", "${product.weightKg} kg"))
+                }
                 addView(detailRow("Reviews", "${product.rating}/5 from ${product.reviewCount}"))
-                addView(detailRow("Review insight", product.reviewSentiment))
+                if (isSpecMeaningful(product.reviewSentiment) &&
+                    !product.reviewSentiment.startsWith("No aggregated", ignoreCase = true)) {
+                    addView(detailRow("Review insight", product.reviewSentiment))
+                }
             }, fullWidth(bottom = dp(12)))
             addView(card(paleRed, Color.rgb(236, 188, 188)).apply {
                 addView(text("Trade-offs to consider", 16f, ink, Typeface.BOLD), fullWidth(bottom = dp(8)))
@@ -1130,81 +1353,163 @@ class MainActivity : Activity() {
                 toggleFinalist(product, !selectedIds.contains(product.id))
             }, fullWidth(bottom = dp(8)))
             addView(button("Choose ${product.name}", primary = true) { chooseProduct(product.id) }, fullWidth(bottom = dp(8)))
-            addView(button(if (selectedIds.size == 2) "Compare 2 laptops" else "Back to matches") {
-                setStage(if (selectedIds.size == 2) Stage.COMPARE else Stage.RECOMMEND)
+            addView(button(if (canCompare()) "Compare ${selectedIds.size} items" else "Back to matches") {
+                setStage(if (canCompare()) Stage.COMPARE else Stage.RECOMMEND)
             })
         }
     }
 
     private fun compareScreen(): View {
-        val finalists = selectedIds.mapNotNull { id -> laptops.find { it.id == id } }.sortedByDescending { matchScore(it) }
+        val finalists = selectedIds.mapNotNull { id -> laptops.find { it.id == id } }
+            .sortedByDescending { matchScore(it) }
         return scrollColumn(left = dp(14), right = dp(14)).apply {
-            addView(text("Compare laptops", 22f, ink, Typeface.BOLD), fullWidth(bottom = dp(14)))
-            if (finalists.size != 2) {
+            addView(text("Compare products", 22f, ink, Typeface.BOLD), fullWidth(bottom = dp(4)))
+            addView(text(
+                "Attributes side by side. Scroll sideways to see every column.",
+                13f, muted
+            ), fullWidth(bottom = dp(14)))
+            if (finalists.size < 2) {
                 addView(card(surface).apply {
                     addView(text(
-                        if (finalists.isEmpty()) "Your compare list is empty" else "One laptop ready",
-                        16f,
-                        ink,
-                        Typeface.BOLD
+                        if (finalists.isEmpty()) "Your compare list is empty" else "Add one more item",
+                        16f, ink, Typeface.BOLD
                     ), fullWidth(bottom = dp(6)))
                     addView(text(
-                        if (finalists.isEmpty()) "Add two laptops from Matches to see them side by side."
-                        else "${finalists.first().name} is in compare. Add one more laptop.",
-                        13f,
-                        muted
+                        if (finalists.isEmpty())
+                            "Add at least two items from Matches to see them side by side."
+                        else "${finalists.first().name} is in compare. Add at least one more to build the table.",
+                        13f, muted
                     ), fullWidth(bottom = dp(12)))
                     addView(button("Browse matches", primary = true) { setStage(Stage.RECOMMEND) })
                 })
             } else {
-                finalists.forEachIndexed { index, product ->
-                    addView(comparisonCard(product, index == 0), fullWidth(bottom = dp(12)))
-                }
+                addView(compareTable(finalists), fullWidth(bottom = dp(12)))
                 addView(button("Edit comparison") { setStage(Stage.RECOMMEND) })
             }
         }
     }
 
-    private fun comparisonCard(product: Laptop, recommended: Boolean): View = card(if (recommended) paleYellow else Color.WHITE, if (recommended) accent else border).apply {
-        addView(LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(text(product.name, 17f, ink, Typeface.BOLD), fullWidth(bottom = dp(3)))
-                addView(text(if (recommended) recommendationSubtitle(product) else product.summary, 12f, if (recommended) accentDark else muted))
-            }, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(LaptopPreviewView(this@MainActivity, product.color), LinearLayout.LayoutParams(dp(72), dp(62)))
-        }, fullWidth(bottom = dp(10)))
-        addView(detailRow("Price", "${money(product.price)}${if (product.price <= budgetLimit()) " - within budget" else " - over budget"}"))
-        addView(detailRow("Platform", product.platform))
-        addView(detailRow("Display", product.display))
-        addView(detailRow("Performance", product.performance))
-        addView(detailRow("Reviews", "${product.rating}/5 from ${product.reviewCount}. ${product.reviewSentiment}"))
-        addView(detailRow("Weakness", product.weakness))
-        addView(LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(button("Choose ${product.name.substringBefore(" ")}", primary = true) { chooseProduct(product.id) }, LinearLayout.LayoutParams(0, dp(46), 1f).withMargins(right = dp(8)))
-            addView(button("View details") { openDetails(product.id, Stage.COMPARE) }, LinearLayout.LayoutParams(0, dp(46), 1f))
-        }, fullWidth(top = dp(10)))
+    // Side-by-side attribute table: one column per product, one row per
+    // attribute. Rows are picked dynamically so laptop-only specs show only for
+    // computers, and any attribute with no data across all products is skipped.
+    // Wrapped in a HorizontalScrollView so 2..MAX_COMPARE columns fit.
+    private fun compareTable(finalists: List<Laptop>): View {
+        val labelW = dp(94)
+        val colW = dp(150)
+        val budget = budgetLimit()
+        val computer = isComputerCategory()
+
+        fun meaningfulWeakness(p: Laptop): Boolean =
+            isSpecMeaningful(p.weakness) && !p.weakness.startsWith("No notable", ignoreCase = true)
+
+        val attrs = mutableListOf<Pair<String, (Laptop) -> String>>()
+        attrs += "Match" to { p: Laptop -> "${matchScore(p)}%" }
+        attrs += "Price" to { p: Laptop ->
+            money(p.price) + (if (p.price <= budget) "\nwithin budget" else "\nover budget")
+        }
+        attrs += "Rating" to { p: Laptop -> "${p.rating}/5\n(${p.reviewCount})" }
+        if (computer) {
+            attrs += "Platform" to { p: Laptop -> p.platform }
+            if (finalists.any { isSpecMeaningful(it.display) })
+                attrs += "Display" to { p: Laptop -> if (isSpecMeaningful(p.display)) p.display else "—" }
+            if (finalists.any { isSpecMeaningful(it.performance) })
+                attrs += "Performance" to { p: Laptop -> if (isSpecMeaningful(p.performance)) p.performance else "—" }
+        }
+        attrs += "Highlights" to { p: Laptop -> p.summary }
+        if (finalists.any { meaningfulWeakness(it) })
+            attrs += "Weakness" to { p: Laptop -> if (meaningfulWeakness(p)) p.weakness else "—" }
+
+        val table = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        // Header row: empty corner + product names (recommended first, tinted).
+        val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        header.addView(compareCell("", labelW, bold = true, textColor = muted, bg = surface))
+        finalists.forEachIndexed { i, p ->
+            val best = i == 0
+            header.addView(compareCell(
+                (if (best) "★ " else "") + p.name,
+                colW, bold = true,
+                textColor = if (best) accentDark else ink,
+                bg = if (best) paleYellow else surface
+            ))
+        }
+        table.addView(header)
+
+        // Image row: real product thumbnail per column (falls back to placeholder).
+        val imgRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        imgRow.addView(compareCell("", labelW, bold = false, textColor = muted, bg = surface))
+        finalists.forEachIndexed { i, p ->
+            imgRow.addView(FrameLayout(this).apply {
+                layoutParams = LinearLayout.LayoutParams(colW, dp(96))
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+                background = rect(if (i == 0) paleYellow else Color.WHITE, border, 1, 0)
+                addView(
+                    ProductThumbView(this@MainActivity, p.color, isComputerCategory(), p.imageUrl),
+                    FrameLayout.LayoutParams(-1, -1)
+                )
+            })
+        }
+        table.addView(imgRow)
+
+        // Attribute rows with zebra striping; recommended column stays tinted.
+        attrs.forEachIndexed { rowIdx, (label, value) ->
+            val rowBg = if (rowIdx % 2 == 0) Color.WHITE else surface
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            row.addView(compareCell(label, labelW, bold = true, textColor = muted, bg = surface))
+            finalists.forEachIndexed { i, p ->
+                row.addView(compareCell(
+                    value(p), colW, bold = false, textColor = ink,
+                    bg = if (i == 0) paleYellow else rowBg
+                ))
+            }
+            table.addView(row)
+        }
+
+        // Choose-button row.
+        val chooseRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        chooseRow.addView(compareCell("", labelW, bold = false, textColor = muted, bg = surface))
+        finalists.forEach { p ->
+            chooseRow.addView(LinearLayout(this).apply {
+                layoutParams = LinearLayout.LayoutParams(colW, -2)
+                setPadding(dp(6), dp(8), dp(6), dp(8))
+                background = rect(Color.WHITE, border, 1, 0)
+                addView(button("Choose", primary = true) { chooseProduct(p.id) },
+                    LinearLayout.LayoutParams(-1, -2))
+            })
+        }
+        table.addView(chooseRow)
+
+        return HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = true
+            addView(table)
+        }
     }
+
+    private fun compareCell(value: String, width: Int, bold: Boolean, textColor: Int, bg: Int): TextView =
+        text(value, 12f, textColor, if (bold) Typeface.BOLD else Typeface.NORMAL).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            minHeight = dp(44)
+            setPadding(dp(8), dp(9), dp(8), dp(9))
+            background = rect(bg, border, 1, 0)
+            layoutParams = LinearLayout.LayoutParams(width, -2)
+        }
 
     private fun resultScreen(): View {
         if (chosenProductId == null) {
             return scrollColumn().apply {
                 addView(text("Your choice", 22f, ink, Typeface.BOLD), fullWidth(bottom = dp(14)))
                 addView(card(surface).apply {
-                    addView(text("No laptop chosen yet", 16f, ink, Typeface.BOLD), fullWidth(bottom = dp(6)))
+                    addView(text("No item chosen yet", 16f, ink, Typeface.BOLD), fullWidth(bottom = dp(6)))
                     addView(text(
-                        if (selectedIds.size == 2) "Your comparison is ready."
+                        if (canCompare()) "Your comparison is ready."
                         else "Open a match or comparison when you are ready to choose.",
                         13f,
                         muted
                     ), fullWidth(bottom = dp(12)))
                     addView(button(
-                        if (selectedIds.size == 2) "Compare laptops" else "Browse matches",
+                        if (canCompare()) "Compare products" else "Browse matches",
                         primary = true
-                    ) { setStage(if (selectedIds.size == 2) Stage.COMPARE else Stage.RECOMMEND) })
+                    ) { setStage(if (canCompare()) Stage.COMPARE else Stage.RECOMMEND) })
                 })
             }
         }
@@ -1216,7 +1521,7 @@ class MainActivity : Activity() {
                 addView(LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
-                    addView(LaptopPreviewView(this@MainActivity, product.color), LinearLayout.LayoutParams(dp(90), dp(80)).withMargins(right = dp(12)))
+                    addView(ProductThumbView(this@MainActivity, product.color, isComputerCategory(), product.imageUrl), LinearLayout.LayoutParams(dp(90), dp(80)).withMargins(right = dp(12)))
                     addView(LinearLayout(this@MainActivity).apply {
                         orientation = LinearLayout.VERTICAL
                         addView(text(product.name, 19f, ink, Typeface.BOLD), fullWidth(bottom = dp(5)))
@@ -1248,7 +1553,7 @@ class MainActivity : Activity() {
             addView(button("Edit needs") {
                 beginRefinement()
             }, fullWidth(bottom = dp(8)))
-            if (selectedIds.size == 2) addView(button("Review comparison") { setStage(Stage.COMPARE) })
+            if (canCompare()) addView(button("Review comparison") { setStage(Stage.COMPARE) })
         }
     }
 
@@ -1306,15 +1611,20 @@ class MainActivity : Activity() {
     }
 
     private fun submitNeed() {
-        if (shoppingNeed.trim().length < 8) {
-            toast("Describe your laptop need, use voice, or choose the sample task.")
+        if (shoppingNeed.trim().length < 2) {
+            toast("请描述你的购物需求，或使用语音/示例任务。")
             return
         }
         shoppingNeed = shoppingNeed.trim()
         invalidateResults()
+        // Start from a clean brief so the AI's analysis (not stale laptop
+        // defaults) drives the Must-haves / Nice-to-haves for this request.
+        mustHaves.clear()
+        preferences.clear()
+        productCategory = ""
         deriveAssumptionsFromNeed()
-        loadCatalogAsync(shoppingNeed)
-        submitNeedToBackendAsync(shoppingNeed)
+        loadCatalogAsync(buildSearchQuery())
+        startBriefAnalysis(restart = true)
         setStage(Stage.CONTEXT)
     }
 
@@ -1374,6 +1684,14 @@ class MainActivity : Activity() {
                 handler.post {
                     engineSessionId = sessionId
                     Log.i("VoiceShop", "Engine session $sessionId")
+                }
+            }
+
+            override fun onTalkerReady(provider: String, inputAudioSampleRate: Int) {
+                handler.post {
+                    realtimeTalkerProvider = provider
+                    realtimeInputSampleRate = inputAudioSampleRate
+                    Log.i("VoiceShop", "Talker provider=$provider inputRate=$inputAudioSampleRate")
                 }
             }
 
@@ -1531,48 +1849,209 @@ class MainActivity : Activity() {
                 result
                     .onSuccess { response ->
                         uploadedImageId = response.optString("image_id").takeIf { it.isNotBlank() }
-                        val visual = response.optString("visual_context")
-                        if (visual.isNotBlank()) {
-                            imageStyleSignal = visual
-                            if (preferences.none { it.contains("image reference", ignoreCase = true) }) {
-                                preferences.add("Image reference: ${visual.take(90)}")
-                            }
+                        val analysisObj = response.optJSONObject("analysis")
+                        val provider = analysisObj?.optString("provider")
+                        imageLlmProvider = provider?.takeIf { it.isNotBlank() }
+                        imageSearchKeywords = jsonArrayToList(analysisObj?.optJSONArray("search_keywords"))
+                            .map { it.trim() }
+                            .filter { it.isNotBlank() }
+                        imageCategory = analysisObj?.optString("product_category").orEmpty().trim()
+                        // Vision analysis is disabled server-side; visual_context
+                        // is empty. Do NOT derive any on-device style text — the
+                        // image itself will be sent to the LLM with the text.
+                        toast("图片已添加，将与文字一起分析")
+                        if (imageSearchKeywords.isNotEmpty() || imageCategory.isNotBlank()) {
+                            loadCatalogAsync(buildSearchQuery().ifBlank { "laptop" })
                         }
-                        toast("Image analyzed")
                         render()
                     }
                     .onFailure { error ->
                         Log.e("VoiceShop", "Image upload failed", error)
-                        if (imageStyleSignal == null) imageStyleSignal = analyzeImageStyle(uri) ?: "Visual reference"
-                        toast("Image upload failed: ${error.message}")
+                        // No local fallback analysis — just report the failure.
+                        imageLlmProvider = "error"
+                        toast("图片上传失败: ${error.message}")
                         render()
                     }
             }
         }
     }
 
-    private fun submitNeedToBackendAsync(text: String) {
+    // Kick off (or restart) the live streaming analysis shown on the brief page.
+    private fun startBriefAnalysis(restart: Boolean) {
+        // A non-restart call yields to an in-flight run. An explicit restart
+        // (user re-submitting) must always proceed, even if a previous run got
+        // stuck (e.g. its stream broke when the backend was restarted); bumping
+        // the run id below cancels any in-flight reader.
+        if (briefAnalyzing && !restart) return
+        if (restart) {
+            briefAnalysisText = ""
+            val stale = briefAnalysisConn
+            briefAnalysisConn = null
+            if (stale != null) catalogExecutor.execute { runCatching { stale.disconnect() } }
+        }
+        briefAnalyzing = true
+        briefAnalysisPaused = false
+        briefAnalysisDone = false
+        val runId = ++briefAnalysisRun
+        if (stage == Stage.CONTEXT) render()
+        // Send the request text plus the confirmed must-haves / preferences (so
+        // the backend LLM can read constraints like "价格在1000元以内" and extract
+        // the budget). The uploaded image is added server-side as multimodal
+        // input; we still do NOT inject any on-device image description.
+        val extras = (mustHaves + preferences).map { it.trim() }.filter { it.isNotEmpty() }
+        val text = buildString {
+            append(shoppingNeed.trim())
+            if (extras.isNotEmpty()) {
+                if (isNotEmpty()) append("\n\n")
+                append("Preferences/constraints: ")
+                append(extras.joinToString("; "))
+            }
+        }.trim()
+        catalogExecutor.execute {
+            val outcome = runCatching {
+                val sid = ensureBackendSession()
+                streamBriefAnalysis(runId, sid, text)
+            }
+            if (outcome.isFailure && runId == briefAnalysisRun) {
+                Log.e("VoiceShop", "brief analysis stream failed", outcome.exceptionOrNull())
+                fallbackBlockingAnalysis(runId, text)
+            }
+        }
+    }
+
+    // Pause the stream at any time so the user can add more description. Bumping
+    // the run id makes any in-flight reader's updates no-ops.
+    private fun pauseBriefAnalysis() {
+        if (!briefAnalyzing) return
+        briefAnalysisRun++
+        briefAnalyzing = false
+        briefAnalysisPaused = true
+        val conn = briefAnalysisConn
+        briefAnalysisConn = null
+        catalogExecutor.execute { runCatching { conn?.disconnect() } }
+        render()
+    }
+
+    // Read the newline-delimited JSON stream and surface reasoning deltas live.
+    private fun streamBriefAnalysis(runId: Int, sid: String, text: String) {
+        val url = URL("$BACKEND_BASE_URL/api/v1/session/$sid/analyze_stream")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 6000
+            readTimeout = 60_000
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        briefAnalysisConn = conn
+        try {
+            conn.outputStream.use { it.write(JSONObject().put("text", text).toString().toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                val err = conn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                throw IllegalStateException("analyze_stream HTTP $code: $err")
+            }
+            conn.inputStream.bufferedReader().use { reader ->
+                while (runId == briefAnalysisRun) {
+                    val line = reader.readLine() ?: break
+                    val ln = line.trim()
+                    if (ln.isEmpty()) continue
+                    val obj = runCatching { JSONObject(ln) }.getOrNull() ?: continue
+                    when (obj.optString("type")) {
+                        "delta" -> Unit
+                        "done" -> {
+                            val analysis = obj.optJSONObject("analysis")
+                            handler.post {
+                                if (runId != briefAnalysisRun) return@post
+                                briefAnalyzing = false
+                                briefAnalysisPaused = false
+                                briefAnalysisDone = true
+                                applyNeedAnalysis(analysis)
+                                startRecommendationPolling()
+                                if (stage == Stage.CONTEXT) render()
+                            }
+                        }
+                        "error" -> handler.post {
+                            if (runId == briefAnalysisRun) toast("分析出错: ${obj.optString("detail")}")
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (runId == briefAnalysisRun) throw e
+        } finally {
+            runCatching { conn.disconnect() }
+            if (briefAnalysisConn === conn) briefAnalysisConn = null
+            handler.post {
+                if (runId == briefAnalysisRun && briefAnalyzing && !briefAnalysisPaused) {
+                    briefAnalyzing = false
+                    if (stage == Stage.CONTEXT) render()
+                }
+            }
+        }
+    }
+
+    // If streaming is unavailable, fall back to the blocking /text analysis.
+    private fun fallbackBlockingAnalysis(runId: Int, text: String) {
         catalogExecutor.execute {
             val result = runCatching {
                 val sid = ensureBackendSession()
-                val payload = JSONObject().apply { put("text", text) }
-                postSessionText(sid, payload)
+                postSessionText(sid, JSONObject().apply { put("text", text) })
             }
             handler.post {
+                if (runId != briefAnalysisRun) return@post
                 result
                     .onSuccess { response ->
                         response.optString("visual_context")
                             .takeIf { it.isNotBlank() && selectedImageUri != null }
                             ?.let { imageStyleSignal = it }
+                        briefAnalyzing = false
+                        briefAnalysisPaused = false
+                        briefAnalysisDone = true
+                        applyNeedAnalysis(response.optJSONObject("analysis"))
                         startRecommendationPolling()
-                        Log.i("VoiceShop", "Need submitted to engine session ${engineSessionId.orEmpty()}")
+                        if (stage == Stage.CONTEXT) render()
                     }
                     .onFailure { error ->
                         Log.e("VoiceShop", "Need submit failed", error)
-                        toast("Backend need update failed: ${error.message}")
+                        briefAnalyzing = false
+                        briefAnalysisDone = true
+                        toast("需求分析失败: ${error.message}")
+                        if (stage == Stage.CONTEXT) render()
                     }
             }
         }
+    }
+
+    // Apply the LLM-derived shopping brief returned by /session/{id}/text so
+    // the Must-haves / Nice-to-haves reflect the model's understanding.
+    private fun applyNeedAnalysis(analysis: JSONObject?) {
+        if (analysis == null) return
+        val provider = analysis.optString("provider")
+        needLlmProvider = provider.takeIf { it.isNotBlank() }
+        val apiSummary = analysis.optString("summary").trim()
+        briefAnalysisText = if (apiSummary.isNotBlank()) {
+            "API 对这段对话的对话总结：\n$apiSummary"
+        } else {
+            "API 未返回对话总结，已使用基础分析。"
+        }
+        analysis.optString("category").trim().takeIf { it.isNotEmpty() }?.let { productCategory = it }
+        if (provider == "qwen") {
+            val must = jsonArrayToList(analysis.optJSONArray("must_haves"))
+            val nice = jsonArrayToList(analysis.optJSONArray("nice_to_haves"))
+            if (must.isNotEmpty()) { mustHaves.clear(); mustHaves.addAll(must) }
+            if (nice.isNotEmpty()) { preferences.clear(); preferences.addAll(nice) }
+            // Capture the LLM's budget so the filter/label reflect it even when
+            // the must-have wording carries no digits (e.g. "价格实惠").
+            analysis.optInt("budget", 0).takeIf { it > 0 }?.let { analyzedBudget = it }
+            when (analysis.optString("platform")) {
+                "Windows" -> osPreference = "Windows"
+                "macOS" -> osPreference = "macOS"
+            }
+            toast("AI 已分析你的需求")
+        } else {
+            toast("未连上大模型，使用基础分析")
+        }
+        render()
     }
 
     private fun postSessionText(sessionId: String, payload: JSONObject): JSONObject {
@@ -1581,7 +2060,7 @@ class MainActivity : Activity() {
             requestMethod = "POST"
             doOutput = true
             connectTimeout = 6000
-            readTimeout = 15_000
+            readTimeout = 30_000
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
         }
         try {
@@ -1654,6 +2133,10 @@ class MainActivity : Activity() {
             readTimeout = 6000
         }
         try {
+            // 404 means the backend no longer knows this session (e.g. it was
+            // restarted). Signal that distinctly so the poller can drop the stale
+            // id and re-establish, instead of polling a dead session forever.
+            if (conn.responseCode == HttpURLConnection.HTTP_NOT_FOUND) throw SessionGoneException()
             if (conn.responseCode != HttpURLConnection.HTTP_OK) return null
             val body = conn.inputStream.bufferedReader().use { it.readText() }
             val obj = JSONObject(body)
@@ -1677,7 +2160,7 @@ class MainActivity : Activity() {
             mapped.add(
                 Laptop(
                     id = item.optString("id").ifBlank { "w$i" },
-                    name = item.optString("name").ifBlank { "Laptop" },
+                    name = item.optString("name").ifBlank { "Product" },
                     price = item.optInt("price", 0),
                     match = item.optInt("score", 80).coerceIn(60, 99),
                     rating = item.optDouble("rating", 0.0),
@@ -1694,7 +2177,8 @@ class MainActivity : Activity() {
                     reasons = jsonArrayToList(item.optJSONArray("reasons")).ifEmpty { listOf("Worker match") },
                     tradeOffs = listOf("Confirm specs before purchase"),
                     color = catalogColors[i % catalogColors.size],
-                    platform = item.optString("platform").ifBlank { "Windows" }
+                    platform = item.optString("platform").ifBlank { "Windows" },
+                    imageUrl = item.optString("image_url").trim()
                 )
             )
         }
@@ -1712,6 +2196,7 @@ class MainActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             action()
         } else {
+            pendingMicAction = action
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_MIC)
         }
     }
@@ -1722,13 +2207,15 @@ class MainActivity : Activity() {
             enterDuplexAudioMode()
             if (audioPlayer == null) audioPlayer = AudioPlayer()
             val capture = AudioCapture(
+                sampleRate = realtimeInputSampleRate,
                 onPcmChunk = { pcm -> realtime?.appendAudioPcm16(pcm) },
                 onEnergy = { rms -> maybeLocalBargeIn(rms) }
             )
             capture.start()
             audioCapture = capture
             gptListening = true
-            toast("Live duplex on — speak anytime to interrupt")
+            val providerLabel = if (realtimeTalkerProvider == "openai") "GPT Realtime" else "Qwen Realtime"
+            toast("$providerLabel duplex on — speak anytime to interrupt")
             render()
         } catch (error: Exception) {
             gptListening = false
@@ -1797,10 +2284,13 @@ class MainActivity : Activity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_MIC) {
+            val action = pendingMicAction
+            pendingMicAction = null
             if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
-                if (gptConnected) startGptVoiceCapture() else connectGpt()
+                if (action != null) action()
+                else if (gptConnected) startGptVoiceCapture() else connectGpt()
             } else {
-                toast("Microphone permission required to start calling")
+                toast("Microphone permission required for voice input")
             }
         }
     }
@@ -1849,11 +2339,14 @@ class MainActivity : Activity() {
         scrollPositions.keys.removeAll { it in setOf(Stage.REFINE, Stage.RECOMMEND, Stage.DETAIL, Stage.COMPARE, Stage.RESULT) }
     }
 
+    // At least 2 products are needed to show the comparison table.
+    private fun canCompare(): Boolean = selectedIds.size >= 2
+
     private fun toggleFinalist(product: Laptop, checked: Boolean) {
-        if (checked && !selectedIds.contains(product.id) && selectedIds.size >= 2) {
+        if (checked && !selectedIds.contains(product.id) && selectedIds.size >= MAX_COMPARE) {
             val current = selectedIds.map(::laptop)
             AlertDialog.Builder(this)
-                .setTitle("Replace a laptop?")
+                .setTitle("Compare up to $MAX_COMPARE — replace one?")
                 .setItems(current.map { it.name }.toTypedArray()) { _, index ->
                     selectedIds.remove(current[index].id)
                     selectedIds.add(product.id)
@@ -1898,7 +2391,7 @@ class MainActivity : Activity() {
             Stage.RESULT -> setStage(
                 when {
                     chosenProductId == null -> Stage.RECOMMEND
-                    selectedIds.size == 2 -> Stage.COMPARE
+                    canCompare() -> Stage.COMPARE
                     else -> Stage.DETAIL
                 }
             )
@@ -1916,6 +2409,10 @@ class MainActivity : Activity() {
                 selectedImageName = null
                 imageStyleSignal = null
                 uploadedImageId = null
+                imageSearchKeywords = emptyList()
+                imageCategory = ""
+                imageLlmProvider = null
+                needLlmProvider = null
                 imageUploadInFlight = false
                 mustHaves.apply { clear(); addAll(listOf("Budget up to ¥7,000", "Design-studio use", "Strong display", "16GB RAM preferred")) }
                 preferences.apply { clear(); addAll(listOf("Portable for campus", "Long battery life", "Silver or neutral style")) }
@@ -1946,11 +2443,135 @@ class MainActivity : Activity() {
     }
 
     @Suppress("DEPRECATION")
+    // Voice input via the backend ASR API (Qwen-Omni). Works even where the
+    // on-device recognizer is missing (e.g. emulators). Records mic PCM, uploads
+    // it for transcription, then merges the transcript with any typed text.
+    // Image signals are already merged through the session + buildSearchQuery.
     private fun launchVoiceInput() {
+        ensureMicPermissionThen { startVoiceRecording() }
+    }
+
+    private fun startVoiceRecording() {
+        if (voiceRecordCapture != null) return
+        val buffer = ByteArrayOutputStream()
+        val capture = try {
+            AudioCapture(onPcmChunk = { pcm -> synchronized(buffer) { buffer.write(pcm) } })
+                .also { it.start() }
+        } catch (e: Exception) {
+            Log.w("VoiceShop", "mic capture failed, falling back to device recognizer", e)
+            launchDeviceVoiceInput()
+            return
+        }
+        voiceRecordBuffer = buffer
+        voiceRecordCapture = capture
+        voiceRecordDialog = AlertDialog.Builder(this)
+            .setTitle(if (voiceTarget == VoiceTarget.NEED) "Speak your need" else "Speak to add")
+            .setMessage("Listening… tap \"Stop\" when you're done.")
+            .setCancelable(false)
+            .setPositiveButton("Stop & transcribe") { _, _ -> finishVoiceRecording(cancelled = false) }
+            .setNegativeButton("Cancel") { _, _ -> finishVoiceRecording(cancelled = true) }
+            .show()
+    }
+
+    private fun finishVoiceRecording(cancelled: Boolean) {
+        val capture = voiceRecordCapture
+        val buffer = voiceRecordBuffer
+        voiceRecordCapture = null
+        voiceRecordBuffer = null
+        voiceRecordDialog?.dismiss()
+        voiceRecordDialog = null
+        capture?.stop()
+        if (cancelled || buffer == null) return
+        val pcm = synchronized(buffer) { buffer.toByteArray() }
+        if (pcm.size < 3200) { toast("Too short — try again"); return }
+        val target = voiceTarget
+        toast("Transcribing…")
+        catalogExecutor.execute {
+            val result = runCatching { postTranscribe(pcm16ToWav(pcm, AudioCapture.SAMPLE_RATE)) }
+            handler.post {
+                result
+                    .onSuccess { text ->
+                        if (text.isBlank()) toast("Didn't catch that")
+                        else applyTranscript(text, target)
+                    }
+                    .onFailure { e ->
+                        Log.e("VoiceShop", "transcribe failed", e)
+                        toast("Voice API failed: ${e.message}")
+                    }
+            }
+        }
+    }
+
+    // Merge the transcript with whatever is already typed. For NEED this keeps
+    // any existing text (and the session already holds image context), so voice
+    // + image + text are combined rather than overwriting each other.
+    private fun applyTranscript(text: String, target: VoiceTarget) {
+        val spoken = text.trim()
+        if (spoken.isEmpty()) return
+        if (target == VoiceTarget.NEED) {
+            shoppingNeed = listOf(shoppingNeed.trim(), spoken)
+                .filter { it.isNotBlank() }
+                .joinToString(". ")
+            render()
+            submitNeed()
+        } else {
+            mustHaves.add(spoken)
+            invalidateResults()
+            if (stage == Stage.REFINE) {
+                analysisPaused = true
+                analysisProgress = minOf(analysisProgress, 2)
+            }
+            render()
+        }
+    }
+
+    private fun postTranscribe(wav: ByteArray): String {
+        val url = URL("$BACKEND_BASE_URL/api/v1/transcribe")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 8000
+            readTimeout = 60_000
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        try {
+            val payload = JSONObject().apply {
+                put("audio_base64", Base64.encodeToString(wav, Base64.NO_WRAP))
+                put("format", "wav")
+                put("mime_type", "audio/wav")
+            }
+            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+            val body = (if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.use { it.readText() }.orEmpty()
+            if (conn.responseCode !in 200..299) {
+                throw IllegalStateException("Transcribe HTTP ${conn.responseCode}: $body")
+            }
+            return JSONObject(body).optString("text").trim()
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun pcm16ToWav(pcm: ByteArray, sampleRate: Int): ByteArray {
+        val channels = 1
+        val bits = 16
+        val byteRate = sampleRate * channels * bits / 8
+        val out = ByteArrayOutputStream(44 + pcm.size)
+        fun le32(v: Int) { out.write(v and 0xff); out.write((v shr 8) and 0xff); out.write((v shr 16) and 0xff); out.write((v shr 24) and 0xff) }
+        fun le16(v: Int) { out.write(v and 0xff); out.write((v shr 8) and 0xff) }
+        out.write("RIFF".toByteArray(Charsets.US_ASCII)); le32(36 + pcm.size); out.write("WAVE".toByteArray(Charsets.US_ASCII))
+        out.write("fmt ".toByteArray(Charsets.US_ASCII)); le32(16); le16(1); le16(channels)
+        le32(sampleRate); le32(byteRate); le16(channels * bits / 8); le16(bits)
+        out.write("data".toByteArray(Charsets.US_ASCII)); le32(pcm.size); out.write(pcm)
+        return out.toByteArray()
+    }
+
+    // On-device recognizer, kept as a fallback when the mic/API path is unusable.
+    private fun launchDeviceVoiceInput() {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-            putExtra(RecognizerIntent.EXTRA_PROMPT, if (voiceTarget == VoiceTarget.NEED) "What matters in your next laptop?" else "What should I add?")
+            putExtra(RecognizerIntent.EXTRA_PROMPT, if (voiceTarget == VoiceTarget.NEED) "What are you looking to buy?" else "What should I add?")
         }
         try {
             startActivityForResult(intent, REQUEST_VOICE)
@@ -1980,20 +2601,7 @@ class MainActivity : Activity() {
         when (requestCode) {
             REQUEST_VOICE -> {
                 val spoken = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.trim().orEmpty()
-                if (spoken.isNotBlank()) {
-                    if (voiceTarget == VoiceTarget.NEED) {
-                        shoppingNeed = spoken
-                        invalidateResults()
-                    } else {
-                        mustHaves.add(spoken)
-                        invalidateResults()
-                        if (stage == Stage.REFINE) {
-                            analysisPaused = true
-                            analysisProgress = minOf(analysisProgress, 2)
-                        }
-                    }
-                    render()
-                }
+                if (spoken.isNotBlank()) applyTranscript(spoken, voiceTarget)
             }
             REQUEST_IMAGE -> data?.data?.let { uri ->
                 runCatching {
@@ -2003,10 +2611,16 @@ class MainActivity : Activity() {
                 selectedImageName = displayName(uri)
                 imageStyleSignal = null
                 uploadedImageId = null
+                imageSearchKeywords = emptyList()
+                imageCategory = ""
+                imageLlmProvider = null
                 invalidateResults()
                 contextSignalChanged()
                 render()
-                analyzeImageStyleAsync(uri)
+                // Local pixel "style" analysis disabled on purpose: the image is
+                // not processed on-device; it is uploaded and later fed to the
+                // LLM together with the text (true multimodal).
+                // analyzeImageStyleAsync(uri)
                 uploadSelectedImageAsync(uri)
             }
         }
@@ -2154,7 +2768,13 @@ class MainActivity : Activity() {
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
 
-    private class LaptopPreviewView(context: Context, private val laptopColor: Int) : View(context) {
+    // Generic product thumbnail. Draws a laptop for computer categories and a
+    // neutral shopping bag for everything else, so the icon reflects the search.
+    private class LaptopPreviewView(
+        context: Context,
+        private val laptopColor: Int,
+        private val isLaptop: Boolean = true
+    ) : View(context) {
         private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = laptopColor; style = Paint.Style.FILL }
         private val screen = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(242, 246, 249); style = Paint.Style.FILL }
         private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(63, 72, 82); style = Paint.Style.STROKE; strokeWidth = 2.2f }
@@ -2163,6 +2783,10 @@ class MainActivity : Activity() {
             super.onDraw(canvas)
             val w = width.toFloat()
             val h = height.toFloat()
+            if (isLaptop) drawLaptop(canvas, w, h) else drawBag(canvas, w, h)
+        }
+
+        private fun drawLaptop(canvas: Canvas, w: Float, h: Float) {
             val display = RectF(w * .16f, h * .10f, w * .84f, h * .72f)
             canvas.drawRoundRect(display, 8f, 8f, fill)
             canvas.drawRoundRect(RectF(w * .21f, h * .16f, w * .79f, h * .65f), 4f, 4f, screen)
@@ -2176,6 +2800,100 @@ class MainActivity : Activity() {
             }
             canvas.drawPath(base, fill)
             canvas.drawPath(base, stroke)
+        }
+
+        private fun drawBag(canvas: Canvas, w: Float, h: Float) {
+            // Bag body.
+            val body = RectF(w * .20f, h * .32f, w * .80f, h * .90f)
+            canvas.drawRoundRect(body, 10f, 10f, fill)
+            canvas.drawRoundRect(body, 10f, 10f, stroke)
+            // Handle arc.
+            val handle = RectF(w * .34f, h * .12f, w * .66f, h * .52f)
+            canvas.drawArc(handle, 180f, 180f, false, stroke)
+        }
+    }
+
+    /**
+     * Product thumbnail: shows the real catalog image (loaded from image_url) with
+     * rounded corners, falling back to the drawn placeholder icon while loading or
+     * if the network image fails. Zero external dependencies.
+     */
+    private class ProductThumbView(
+        context: Context,
+        color: Int,
+        isLaptop: Boolean,
+        imageUrl: String,
+        cornerRadiusDp: Int = 10
+    ) : FrameLayout(context) {
+        init {
+            val radiusPx = cornerRadiusDp * context.resources.displayMetrics.density
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    outline.setRoundRect(0, 0, view.width, view.height, radiusPx)
+                }
+            }
+            clipToOutline = true
+            val placeholder = LaptopPreviewView(context, color, isLaptop)
+            addView(placeholder, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+            val url = imageUrl.trim()
+            if (url.startsWith("http")) {
+                val img = ImageView(context).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    visibility = View.GONE
+                }
+                addView(img, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+                ImageLoader.load(url, 512) { bmp ->
+                    if (bmp != null) {
+                        img.setImageBitmap(bmp)
+                        img.visibility = View.VISIBLE
+                        placeholder.visibility = View.GONE
+                    }
+                }
+            }
+        }
+    }
+
+    /** Minimal async network image loader with an in-memory LRU cache (no libraries). */
+    private object ImageLoader {
+        private val executor = Executors.newFixedThreadPool(3)
+        private val main = Handler(Looper.getMainLooper())
+        private val cache = object : LinkedHashMap<String, Bitmap>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Bitmap>?): Boolean = size > 80
+        }
+
+        @Synchronized private fun getCached(key: String): Bitmap? = cache[key]
+        @Synchronized private fun putCached(key: String, bmp: Bitmap) { cache[key] = bmp }
+
+        fun load(url: String, maxPx: Int, callback: (Bitmap?) -> Unit) {
+            getCached(url)?.let { callback(it); return }
+            executor.execute {
+                val bmp = try { fetch(url, maxPx) } catch (e: Exception) { null }
+                if (bmp != null) putCached(url, bmp)
+                main.post { callback(bmp) }
+            }
+        }
+
+        private fun fetch(urlStr: String, maxPx: Int): Bitmap? {
+            val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 8000
+                readTimeout = 8000
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", "VoiceShop/1.0 (Android)")
+            }
+            try {
+                if (conn.responseCode !in 200..299) return null
+                val bytes = conn.inputStream.use { it.readBytes() }
+                if (bytes.isEmpty()) return null
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                var sample = 1
+                val longest = maxOf(bounds.outWidth, bounds.outHeight)
+                while (longest > 0 && longest / sample > maxPx) sample *= 2
+                val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+            } finally {
+                conn.disconnect()
+            }
         }
     }
 
@@ -2191,6 +2909,8 @@ class MainActivity : Activity() {
         private const val LOCAL_BARGE_IN_RMS = 1800.0
         private const val IMAGE_UPLOAD_MAX_SIDE = 1024
         private const val IMAGE_UPLOAD_JPEG_QUALITY = 82
-        private const val SAMPLE_NEED = "I need a laptop for design studies with a budget of ¥7,000 RMB. I care about display quality, 16GB memory, and portability."
+        /** How many products can be added to the side-by-side comparison table. */
+        private const val MAX_COMPARE = 4
+        private const val SAMPLE_NEED = "I want lightweight running shoes for daily jogging, budget around ¥500, breathable and from a well-reviewed brand."
     }
 }
