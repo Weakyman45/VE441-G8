@@ -12,6 +12,7 @@ from ..llm.qwen_client import chat_json, qwen_configured
 from ..memory_store import MEMORY_STORE, MemoryStore
 from ..modality_router import route as modality_route
 from ..models import PreferenceProfile, SessionState
+from ..query_fusion import default_fuse_weights, normalize_fuse_weights
 from ..talker.shopping_safety import assess_shopping_risk, shopping_safety_enabled
 from .plan_schema import Plan, PlanHints, build_dag
 
@@ -210,12 +211,14 @@ def plan(
     replan_ctx: dict[str, Any] | None = None,
     memory: MemoryStore | None = None,
     config: ExpConfig | None = None,
+    change_kind: str | None = None,
 ) -> dict[str, Any]:
     """Compile an executable Plan dict (control plane only)."""
     cfg = config or load_config()
     store = memory or MEMORY_STORE
     plan_id = uuid.uuid4().hex[:10]
     text = _latest_utterance(session, utterance)
+    change_kind = (change_kind or "").strip().lower() or None
 
     # 1) Safety gate — hard refuse only for dangerous/restricted shopping.
     safety = {"category": "normal", "reasons": [], "refused": False}
@@ -280,8 +283,16 @@ def plan(
             session.preference, ["drop_hard", "raise_budget_20", "broaden_keywords"]
         )
 
-    # 5) LLM PlanHints
+    # 5) Capability / budget + modality route (needed for default fuse weights)
+    budget = _capability_budget(cfg)
+    route_plan = modality_route(session, cfg)
+    if not budget["visual_recall_ready"]:
+        # Compile-time capability gate: disable visual stage even if router asked.
+        route_plan.do_visual_recall = False
+
+    # 6) LLM PlanHints (+ modality-default fuse weights)
     hints = PlanHints(query_hint=_fallback_query_hint(session.preference), intent=intent)
+    hints.fuse_weights = default_fuse_weights(route_plan.modality)
     if cfg.planner_llm and qwen_configured():
         llm_hints = _llm_hints(session, intent=intent, replan_ctx=replan_ctx)
         if llm_hints.query_hint:
@@ -289,7 +300,9 @@ def plan(
         if llm_hints.focus:
             hints.focus = llm_hints.focus
         if llm_hints.fuse_weights:
-            hints.fuse_weights = llm_hints.fuse_weights
+            hints.fuse_weights = normalize_fuse_weights(
+                llm_hints.fuse_weights, modality=route_plan.modality
+            )
         if llm_hints.relax_ops:
             hints.relax_ops = llm_hints.relax_ops
         if llm_hints.reason:
@@ -306,19 +319,16 @@ def plan(
         hints.reason = f"Pipeline for intent={intent}"
     hints.intent = intent
 
-    # 6) Capability / budget
-    budget = _capability_budget(cfg)
-    route_plan = modality_route(session, cfg)
-    if not budget["visual_recall_ready"]:
-        # Compile-time capability gate: disable visual stage even if router asked.
-        route_plan.do_visual_recall = False
-
     focus_ids = list(memory_meta.get("resolved_refs") or [])
     has_bundle = bool(session.worker.last_bundle and session.worker.last_bundle.ranked)
+    # Soft preference edits (or refine/followup/compare) reuse the shortlist.
+    # Hard / recall changes always take the full recall → verify → recommend path.
     shortcircuit = bool(
         cfg.intent_shortcircuit
-        and intent in ("refine", "followup", "compare")
         and has_bundle
+        and change_kind != "hard"
+        and change_kind != "recall"
+        and (change_kind == "soft" or intent in ("refine", "followup", "compare"))
     )
     if shortcircuit:
         planner_mode = "light" if planner_mode == "rules" else planner_mode
@@ -368,9 +378,11 @@ def plan(
         decision={
             "safety": safety,
             "intent": intent,
+            "change_kind": change_kind or "",
             "memory": memory_meta,
             "budget": budget,
             "route": route_plan.to_dict(),
+            "fuse_weights": dict(hints.fuse_weights),
             "shortcircuit": shortcircuit,
             "applied_relax": applied_relax,
             "replan_attempt": int((replan_ctx or {}).get("attempt") or 0),

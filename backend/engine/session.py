@@ -51,13 +51,30 @@ class SessionStore:
             state.preference = preference
             return state.preference
 
-    def set_worker_status(self, session_id: str, status: str, message: str = "", plan_id: str = "") -> None:
+    def bump_worker_run(self, session_id: str) -> int:
+        """Invalidate in-flight Worker results; return the new run_id."""
+        with self._lock:
+            state = self.require(session_id)
+            state.worker.run_id += 1
+            return state.worker.run_id
+
+    def set_worker_status(
+        self,
+        session_id: str,
+        status: str,
+        message: str = "",
+        plan_id: str = "",
+        *,
+        run_id: int | None = None,
+    ) -> None:
         with self._lock:
             state = self.require(session_id)
             state.worker.status = status
             state.worker.message = message
             if plan_id:
                 state.worker.plan_id = plan_id
+            if run_id is not None:
+                state.worker.run_id = run_id
 
     def set_bundle(self, session_id: str, bundle: RecommendationBundle) -> None:
         with self._lock:

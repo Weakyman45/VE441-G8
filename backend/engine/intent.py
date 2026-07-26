@@ -1,9 +1,57 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from typing import Iterable, Literal
 
 from .models import PreferenceProfile
+
+PreferenceChangeKind = Literal["none", "soft", "hard", "recall"]
+
+
+def classify_preference_change(
+    prior: PreferenceProfile | None,
+    current: PreferenceProfile,
+) -> PreferenceChangeKind:
+    """Classify how much a preference update should disturb the Worker pipeline.
+
+    - none:   no material change
+    - soft:   nice-to-haves / ranking signals only → rerank existing shortlist
+    - hard:   must-have / category / budget / platform → full cancel + replan
+    - recall: query/keywords changed without hard-constraint edits → new recall
+    """
+    if prior is None:
+        return "recall"
+
+    hard_changed = (
+        (prior.category or "").strip().lower() != (current.category or "").strip().lower()
+        or prior.budget != current.budget
+        or (prior.platform or "") != (current.platform or "")
+        or _norm_list(prior.hard) != _norm_list(current.hard)
+    )
+    if hard_changed:
+        return "hard"
+
+    keywords_changed = _norm_list(prior.search_keywords) != _norm_list(current.search_keywords)
+    query_changed = (prior.raw_query or "").strip() != (current.raw_query or "").strip()
+    soft_changed = (
+        _norm_list(prior.soft) != _norm_list(current.soft)
+        or (prior.use_case or "") != (current.use_case or "")
+        or (prior.touch or "") != (current.touch or "")
+        or (prior.visual_context or "") != (current.visual_context or "")
+    )
+
+    if keywords_changed:
+        return "recall"
+    if soft_changed:
+        return "soft"
+    if query_changed:
+        # Same structured slots; utterance may still be a refine/followup.
+        return "soft"
+    return "none"
+
+
+def _norm_list(values: list[str] | None) -> list[str]:
+    return sorted({str(v).strip().lower() for v in (values or []) if str(v).strip()})
 
 
 def extract_preference(text: str, prior: PreferenceProfile | None = None) -> PreferenceProfile:

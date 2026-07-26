@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>VoiceShop++ PC 通话测试</title>
+  <title>VoiceShop++ 语音通话测试</title>
   <style>
     :root {
       --bg: #12151c;
@@ -12,8 +12,11 @@
       --muted: #9aa6bd;
       --accent: #3d8bfd;
       --ok: #3ecf8e;
+      --warn: #f0c35a;
       --bad: #ff6b6b;
       --line: #2a3348;
+      --you: #9ec1ff;
+      --bot: #9ef0c7;
     }
     * { box-sizing: border-box; }
     body {
@@ -27,23 +30,70 @@
       color: var(--text);
     }
     main {
-      max-width: 760px;
+      max-width: 1120px;
       margin: 0 auto;
-      padding: 32px 20px 48px;
+      padding: 24px 16px 40px;
+      display: grid;
+      grid-template-columns: 1.35fr 1fr;
+      gap: 16px;
+    }
+    @media (max-width: 920px) {
+      main { grid-template-columns: 1fr; }
     }
     h1 {
-      margin: 0 0 8px;
-      font-size: 1.6rem;
+      grid-column: 1 / -1;
+      margin: 0;
+      font-size: 1.5rem;
       font-weight: 650;
-      letter-spacing: 0.02em;
     }
-    .sub { color: var(--muted); margin-bottom: 24px; line-height: 1.5; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+    .sub {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      margin: 0 0 4px;
+      line-height: 1.5;
+      font-size: 0.92rem;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    label.field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    label.check {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 0.86rem;
+      user-select: none;
+    }
+    select, input[type="text"] {
+      background: #151b28;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 0.95rem;
+      min-width: 140px;
+    }
     button {
       border: 0;
       border-radius: 10px;
       padding: 12px 18px;
-      font-size: 1rem;
+      font-size: 0.95rem;
       font-weight: 600;
       cursor: pointer;
       background: var(--accent);
@@ -51,91 +101,388 @@
     }
     button:disabled { opacity: 0.45; cursor: not-allowed; }
     button.stop { background: #5a6478; }
+    button.mute { background: #2f3a52; }
+    button.mute.on { background: #7a4a2a; }
     .pill {
       display: inline-flex;
       align-items: center;
       gap: 8px;
       padding: 8px 12px;
       border-radius: 999px;
-      background: var(--panel);
+      background: #151b28;
       border: 1px solid var(--line);
       color: var(--muted);
-      font-size: 0.9rem;
+      font-size: 0.85rem;
     }
     .dot {
       width: 8px; height: 8px; border-radius: 50%;
-      background: #666;
+      background: #666; flex-shrink: 0;
     }
     .dot.on { background: var(--ok); box-shadow: 0 0 0 4px rgba(62, 207, 142, 0.15); }
+    .dot.warn { background: var(--warn); }
     .dot.err { background: var(--bad); }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 16px;
-      min-height: 280px;
-      white-space: pre-wrap;
-      line-height: 1.55;
-      font-size: 0.95rem;
+    .meter-wrap {
+      flex: 1; min-width: 160px; height: 10px;
+      background: #151b28; border: 1px solid var(--line);
+      border-radius: 999px; overflow: hidden;
     }
-    .you { color: #9ec1ff; }
-    .bot { color: #9ef0c7; }
+    .meter {
+      height: 100%; width: 0%;
+      background: linear-gradient(90deg, #2f8f63, #3ecf8e);
+      transition: width 60ms linear;
+    }
+    .chat { display: flex; flex-direction: column; min-height: min(68vh, 680px); }
+    .chat .log { flex: 1; min-height: 220px; max-height: min(42vh, 420px); }
+    .chat h2, .side h2 {
+      margin: 0 0 10px; font-size: 0.95rem; font-weight: 600; color: var(--muted);
+    }
+    .log {
+      flex: 1; overflow: auto; white-space: pre-wrap;
+      line-height: 1.55; font-size: 0.93rem;
+    }
+    .you { color: var(--you); }
+    .bot { color: var(--bot); }
     .sys { color: var(--muted); }
-    .hint { margin-top: 14px; color: var(--muted); font-size: 0.85rem; line-height: 1.5; }
+    .partial { opacity: 0.72; font-style: italic; }
+    .side { display: flex; flex-direction: column; gap: 12px; }
+    .meta-grid {
+      display: grid; grid-template-columns: 110px 1fr;
+      gap: 6px 10px; font-size: 0.86rem;
+    }
+    .meta-grid dt { color: var(--muted); }
+    .meta-grid dd { margin: 0; word-break: break-all; }
+    .recs { display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow: auto; }
+    .rec-card {
+      border: 1px solid var(--line); border-radius: 10px;
+      padding: 10px 12px; background: #151b28;
+    }
+    .rec-card strong { display: block; margin-bottom: 4px; font-size: 0.92rem; }
+    .rec-card span { color: var(--muted); font-size: 0.82rem; }
+    .product-strip {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+    }
+    .product-strip h2 {
+      margin: 0 0 10px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .product-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 10px;
+      max-height: 320px;
+      overflow: auto;
+    }
+    a.product-card {
+      display: grid;
+      grid-template-columns: 88px 1fr;
+      gap: 10px;
+      text-decoration: none;
+      color: inherit;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: #151b28;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    a.product-card:hover {
+      border-color: #4a6ea8;
+      background: #1a2438;
+    }
+    .product-card .thumb {
+      width: 88px;
+      height: 88px;
+      border-radius: 10px;
+      object-fit: contain;
+      background: #0f141f;
+      border: 1px solid var(--line);
+    }
+    .product-card .thumb-fallback {
+      width: 88px;
+      height: 88px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0f141f;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.72rem;
+      text-align: center;
+      padding: 6px;
+    }
+    .product-card .name {
+      font-weight: 650;
+      font-size: 0.9rem;
+      line-height: 1.35;
+      margin-bottom: 4px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .product-card .price { color: var(--ok); font-weight: 700; font-size: 0.95rem; }
+    .product-card .meta-line { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
+    .product-card .reasons {
+      color: #c5d0e6;
+      font-size: 0.78rem;
+      margin-top: 6px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .hint { color: var(--muted); font-size: 0.82rem; line-height: 1.5; margin: 0; }
+    a { color: #8cbcff; }
+    code { background: #151b28; padding: 1px 6px; border-radius: 6px; font-size: 0.85em; }
+    .warn-box {
+      grid-column: 1 / -1;
+      border: 1px solid rgba(240, 195, 90, 0.35);
+      background: rgba(240, 195, 90, 0.08);
+      color: #f6df9a;
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-size: 0.86rem;
+      line-height: 1.45;
+    }
   </style>
 </head>
 <body>
   <main>
-    <h1>VoiceShop++ PC 通话测试</h1>
-    <p class="sub">用电脑麦克风直接连本机后端（GPT Realtime 优先，Qwen Realtime 兜底），无需 Android 模拟器。</p>
-
-    <div class="row">
-      <button id="btnStart">开始通话</button>
-      <button id="btnStop" class="stop" disabled>结束通话</button>
-      <span class="pill"><span id="statusDot" class="dot"></span><span id="statusText">未连接</span></span>
+    <h1>VoiceShop++ 语音通话测试</h1>
+    <p class="sub">
+      浏览器麦克风直连本机 Realtime Talker。文本对照：
+      <a href="/chat-test">/chat-test</a>
+    </p>
+    <div class="warn-box">
+      打断请尽量戴耳机。外放时回声消除会压掉你的声音，服务端 VAD 可能听不到打断。
+      本页默认开启「本地打断」：检测到你说话会立刻停播并发送 <code>response.cancel</code>。
+      若仍断续，可在 <code>backend/.env</code> 设 <code>LOCAL_VAD_ENABLED=0</code> 后重启后端（改用厂商 server_vad）。
     </div>
 
-    <div id="log" class="panel"></div>
-    <p class="hint">
-      浏览器会请求麦克风权限。请用 Chrome / Edge 打开本页。<br />
-      后端需已启动，例如：<code>python3 backend/server.py --port 18765</code>，然后访问
-      <code id="currentUrl">当前 /voice-test 地址</code>
-    </p>
+    <section class="panel" style="display:flex;flex-direction:column;gap:12px;">
+      <div class="row">
+        <label class="field">
+          Talker
+          <select id="talkerSelect">
+            <option value="auto">auto（后端默认）</option>
+            <option value="openai">OpenAI Realtime</option>
+            <option value="qwen">Qwen Omni Realtime</option>
+          </select>
+        </label>
+        <label class="field">
+          Backend
+          <input id="backendInput" type="text" spellcheck="false" />
+        </label>
+        <span class="pill"><span id="healthDot" class="dot"></span><span id="healthText">检查后端…</span></span>
+      </div>
+      <div class="row">
+        <button id="btnStart">开始通话</button>
+        <button id="btnMute" class="mute" disabled>静音</button>
+        <button id="btnStop" class="stop" disabled>结束通话</button>
+        <span class="pill"><span id="statusDot" class="dot"></span><span id="statusText">未连接</span></span>
+        <div class="meter-wrap" title="麦克风电平"><div id="meter" class="meter"></div></div>
+      </div>
+      <div class="row">
+        <label class="check">
+          <input type="checkbox" id="localBargeIn" checked />
+          本地打断（助手说话时，麦克风能量升高即停播）
+        </label>
+      </div>
+      <p class="hint" id="hintLine">启动后请允许麦克风权限。</p>
+    </section>
+
+    <aside class="panel side">
+      <h2>会话信息</h2>
+      <dl class="meta-grid">
+        <dt>session</dt><dd id="metaSession">—</dd>
+        <dt>talker</dt><dd id="metaTalker">—</dd>
+        <dt>input Hz</dt><dd id="metaRate">—</dd>
+        <dt>interrupt</dt><dd id="metaInterrupt">—</dd>
+        <dt>worker</dt><dd id="metaWorker">—</dd>
+      </dl>
+      <h2>Worker 推荐</h2>
+      <div id="recs" class="recs"><div class="sys">通话开始后自动轮询…</div></div>
+    </aside>
+
+    <section class="panel chat" style="grid-column:1/-1;">
+      <h2>通话转写</h2>
+      <div id="log" class="log"></div>
+      <div class="product-strip">
+        <h2>提到的商品 · 点击卡片查看详情</h2>
+        <div id="productCards" class="product-cards">
+          <div class="sys">推荐就绪后会在这里显示图文卡片</div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <script>
-    let inputRate = 16000;
     const OUTPUT_RATE = 24000;
 
     const btnStart = document.getElementById("btnStart");
     const btnStop = document.getElementById("btnStop");
+    const btnMute = document.getElementById("btnMute");
     const statusDot = document.getElementById("statusDot");
     const statusText = document.getElementById("statusText");
+    const healthDot = document.getElementById("healthDot");
+    const healthText = document.getElementById("healthText");
     const logEl = document.getElementById("log");
-    const backendOrigin = location.protocol === "file:" ? "http://127.0.0.1:18765" : location.origin;
-    document.getElementById("currentUrl").textContent =
-      location.protocol === "file:" ? `${backendOrigin}/voice-test` : location.href;
+    const meterEl = document.getElementById("meter");
+    const talkerSelect = document.getElementById("talkerSelect");
+    const backendInput = document.getElementById("backendInput");
+    const recsEl = document.getElementById("recs");
+    const productCardsEl = document.getElementById("productCards");
+    const localBargeInEl = document.getElementById("localBargeIn");
+    const productCache = new Map();
 
+    const defaultOrigin =
+      location.protocol === "file:" ? "http://127.0.0.1:8000" : location.origin;
+    backendInput.value = defaultOrigin;
+
+    let inputRate = 16000;
     let ws = null;
+    let sessionId = null;
     let mediaStream = null;
     let audioCtx = null;
     let processor = null;
     let sourceNode = null;
-    let playCtx = null;
-    let nextPlayTime = 0;
+    let analyser = null;
+    let meterRaf = 0;
     let assistantBuf = "";
     let userPartial = "";
+    let muted = false;
+    let pollTimer = null;
+    let lastBundleKey = "";
+    let partialUserEl = null;
+    let partialBotEl = null;
+    let assistantPlaying = false;
+    let lastBargeAt = 0;
+
+    /** Smooth PCM16 player: coalesce tiny deltas, hard-stop on barge-in. */
+    class PcmPlayer {
+      constructor(sampleRate) {
+        this.sampleRate = sampleRate;
+        this.ctx = null;
+        this.nextTime = 0;
+        this.sources = new Set();
+        this.pending = [];
+        this.pendingSamples = 0;
+        this.minChunkSamples = Math.floor(sampleRate * 0.04); // ~40ms
+        this.playing = false;
+      }
+      ensure() {
+        if (!this.ctx || this.ctx.state === "closed") {
+          this.ctx = new AudioContext({ sampleRate: this.sampleRate });
+          this.nextTime = 0;
+        }
+        if (this.ctx.state === "suspended") this.ctx.resume();
+        return this.ctx;
+      }
+      push(int16) {
+        if (!int16 || !int16.length) return;
+        this.pending.push(int16);
+        this.pendingSamples += int16.length;
+        if (this.pendingSamples >= this.minChunkSamples) this.flush();
+      }
+      flush() {
+        if (!this.pendingSamples) return;
+        const ctx = this.ensure();
+        const merged = new Int16Array(this.pendingSamples);
+        let off = 0;
+        for (const part of this.pending) {
+          merged.set(part, off);
+          off += part.length;
+        }
+        this.pending = [];
+        this.pendingSamples = 0;
+        const f32 = new Float32Array(merged.length);
+        for (let i = 0; i < merged.length; i++) f32[i] = merged[i] / 32768;
+        const buffer = ctx.createBuffer(1, f32.length, this.sampleRate);
+        buffer.copyToChannel(f32, 0);
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        const now = ctx.currentTime;
+        // Keep a small lookahead so jitter doesn't create gaps / clicks.
+        if (this.nextTime < now + 0.04) this.nextTime = now + 0.04;
+        src.start(this.nextTime);
+        this.nextTime += buffer.duration;
+        this.sources.add(src);
+        this.playing = true;
+        assistantPlaying = true;
+        src.onended = () => {
+          this.sources.delete(src);
+          if (!this.sources.size && this.pendingSamples === 0) {
+            this.playing = false;
+            assistantPlaying = false;
+          }
+        };
+      }
+      stop() {
+        this.pending = [];
+        this.pendingSamples = 0;
+        for (const src of this.sources) {
+          try { src.stop(0); } catch (_) {}
+          try { src.disconnect(); } catch (_) {}
+        }
+        this.sources.clear();
+        this.playing = false;
+        assistantPlaying = false;
+        if (this.ctx) {
+          const old = this.ctx;
+          this.ctx = null;
+          this.nextTime = 0;
+          old.close().catch(() => {});
+        }
+      }
+    }
+
+    const player = new PcmPlayer(OUTPUT_RATE);
+
+    function backendOrigin() {
+      return (backendInput.value || defaultOrigin).replace(/\/$/, "");
+    }
 
     function setStatus(text, kind) {
       statusText.textContent = text;
-      statusDot.className = "dot" + (kind === "on" ? " on" : kind === "err" ? " err" : "");
+      statusDot.className = "dot" + (kind === "on" ? " on" : kind === "err" ? " err" : kind === "warn" ? " warn" : "");
+    }
+
+    function setHealth(text, kind) {
+      healthText.textContent = text;
+      healthDot.className = "dot" + (kind === "on" ? " on" : kind === "err" ? " err" : kind === "warn" ? " warn" : "");
     }
 
     function appendLog(text, cls) {
+      clearPartials();
       const line = document.createElement("div");
       line.className = cls || "sys";
       line.textContent = text;
       logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function clearPartials() {
+      if (partialUserEl) { partialUserEl.remove(); partialUserEl = null; }
+      if (partialBotEl) { partialBotEl.remove(); partialBotEl = null; }
+    }
+
+    function showPartial(role, text) {
+      const cls = role === "you" ? "you partial" : "bot partial";
+      let el = role === "you" ? partialUserEl : partialBotEl;
+      if (!el) {
+        el = document.createElement("div");
+        el.className = cls;
+        logEl.appendChild(el);
+        if (role === "you") partialUserEl = el;
+        else partialBotEl = el;
+      }
+      el.className = cls;
+      el.textContent = (role === "you" ? "You (…): " : "Assistant (…): ") + text;
       logEl.scrollTop = logEl.scrollHeight;
     }
 
@@ -151,17 +498,16 @@
     function resampleToInputRate(float32, inRate) {
       if (inRate === inputRate) return float32;
       const ratio = inRate / inputRate;
-      const newLen = Math.round(float32.length / ratio);
+      const newLen = Math.max(1, Math.round(float32.length / ratio));
       const result = new Float32Array(newLen);
       for (let i = 0; i < newLen; i++) {
-        const idx = Math.floor(i * ratio);
-        result[i] = float32[idx];
+        result[i] = float32[Math.min(float32.length - 1, Math.floor(i * ratio))];
       }
       return result;
     }
 
     function pcm16ToBase64(int16) {
-      const bytes = new Uint8Array(int16.buffer);
+      const bytes = new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength);
       let binary = "";
       const chunk = 0x8000;
       for (let i = 0; i < bytes.length; i += chunk) {
@@ -174,49 +520,66 @@
       const binary = atob(b64);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      return new Int16Array(bytes.buffer);
-    }
-
-    function ensurePlayCtx() {
-      if (!playCtx) {
-        playCtx = new AudioContext({ sampleRate: OUTPUT_RATE });
-        nextPlayTime = 0;
-      }
-      if (playCtx.state === "suspended") playCtx.resume();
-      return playCtx;
-    }
-
-    function playPcm16(int16) {
-      const ctx = ensurePlayCtx();
-      const f32 = new Float32Array(int16.length);
-      for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
-      const buffer = ctx.createBuffer(1, f32.length, OUTPUT_RATE);
-      buffer.copyToChannel(f32, 0);
-      const src = ctx.createBufferSource();
-      src.buffer = buffer;
-      src.connect(ctx.destination);
-      const now = ctx.currentTime;
-      if (nextPlayTime < now) nextPlayTime = now + 0.02;
-      src.start(nextPlayTime);
-      nextPlayTime += buffer.duration;
-    }
-
-    function interruptPlayback() {
-      if (playCtx) {
-        playCtx.close().catch(() => {});
-        playCtx = null;
-        nextPlayTime = 0;
-      }
+      // Copy into a fresh buffer in case byteOffset is unaligned.
+      const copy = new Uint8Array(bytes.length);
+      copy.set(bytes);
+      return new Int16Array(copy.buffer);
     }
 
     function sendJson(obj) {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
     }
 
+    function triggerLocalBargeIn(reason) {
+      const now = performance.now();
+      if (now - lastBargeAt < 400) return;
+      lastBargeAt = now;
+      player.stop();
+      assistantBuf = "";
+      if (partialBotEl) { partialBotEl.remove(); partialBotEl = null; }
+      sendJson({ type: "response.cancel" });
+      appendLog(`[barge-in] ${reason}`, "sys");
+      setStatus("已打断 — 请继续说", "warn");
+    }
+
+    function wsPathForTalker(choice, body) {
+      if (choice === "openai") return "/api/v1/openai/realtime/ws";
+      if (choice === "qwen") return "/api/v1/qwen/realtime/ws";
+      return (body.ws_url || "/api/v1/realtime/ws").split("?")[0];
+    }
+
+    function tickMeter() {
+      if (!analyser) return;
+      const data = new Uint8Array(analyser.fftSize);
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      const pct = muted ? 0 : Math.min(100, Math.round(rms * 280));
+      meterEl.style.width = pct + "%";
+
+      // Client-side barge-in: while assistant audio is queued/playing, a loud mic
+      // means the user is speaking over the agent — stop local playback immediately.
+      if (
+        localBargeInEl.checked &&
+        !muted &&
+        assistantPlaying &&
+        rms > 0.045
+      ) {
+        triggerLocalBargeIn("mic energy while assistant speaking");
+      }
+
+      meterRaf = requestAnimationFrame(tickMeter);
+    }
+
     async function startMic() {
       try {
         mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
+            // Keep AEC on for speakerphones; headphones + local barge-in is best for interrupt.
             echoCancellation: true,
             noiseSuppression: true,
             channelCount: 1,
@@ -225,74 +588,108 @@
       } catch (err) {
         const name = err && err.name ? err.name : "MicrophoneError";
         if (name === "NotAllowedError" || name === "PermissionDeniedError") {
-          throw new Error("麦克风权限被拒绝。请在浏览器地址栏/站点设置中允许麦克风，或用 Chrome/Edge 打开当前 http://127.0.0.1 地址。");
+          throw new Error("麦克风权限被拒绝。请允许麦克风，并用 http://127.0.0.1 打开本页。");
         }
         throw err;
       }
       audioCtx = new AudioContext();
       sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
       processor = audioCtx.createScriptProcessor(4096, 1, 1);
       processor.onaudioprocess = (e) => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN || muted) return;
         const input = e.inputBuffer.getChannelData(0);
         const down = resampleToInputRate(input, audioCtx.sampleRate);
         const pcm = floatTo16BitPCM(down);
         sendJson({ type: "input_audio_buffer.append", audio: pcm16ToBase64(pcm) });
       };
-      // Keep the graph alive without monitoring the mic locally.
-      const mute = audioCtx.createGain();
-      mute.gain.value = 0;
+      const muteGain = audioCtx.createGain();
+      muteGain.gain.value = 0;
+      sourceNode.connect(analyser);
       sourceNode.connect(processor);
-      processor.connect(mute);
-      mute.connect(audioCtx.destination);
+      processor.connect(muteGain);
+      muteGain.connect(audioCtx.destination);
+      meterRaf = requestAnimationFrame(tickMeter);
     }
 
     function stopMic() {
+      cancelAnimationFrame(meterRaf);
+      meterEl.style.width = "0%";
       try { processor && processor.disconnect(); } catch (_) {}
       try { sourceNode && sourceNode.disconnect(); } catch (_) {}
+      try { analyser && analyser.disconnect(); } catch (_) {}
       if (audioCtx) audioCtx.close().catch(() => {});
       if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
       processor = null;
       sourceNode = null;
+      analyser = null;
       audioCtx = null;
       mediaStream = null;
     }
 
     function handleEvent(ev) {
       const t = ev.type || "";
+      if (t === "session.created" || t === "session.updated") {
+        appendLog(`[realtime] ${t}`, "sys");
+        return;
+      }
       if (t === "input_audio_buffer.speech_started") {
-        interruptPlayback();
+        player.stop();
         assistantBuf = "";
-        appendLog("[VAD] 检测到说话", "sys");
+        if (partialBotEl) { partialBotEl.remove(); partialBotEl = null; }
+        appendLog("[VAD] 检测到说话（可打断）", "sys");
+        setStatus("你在说话…", "warn");
+      } else if (t === "input_audio_buffer.speech_stopped") {
+        setStatus("通话中", "on");
+      } else if (t === "response.created") {
+        assistantPlaying = true;
+      } else if (t === "response.cancelled" || t === "response.done" || t === "response.completed") {
+        if (t === "response.cancelled") {
+          player.stop();
+          appendLog("[realtime] response cancelled", "sys");
+        }
+        player.flush();
+        if (t !== "response.cancelled") {
+          // Allow trailing audio already scheduled; mark idle shortly after.
+          setTimeout(() => {
+            if (!player.sources.size) assistantPlaying = false;
+          }, 50);
+        }
+        if (t !== "response.cancelled") setStatus("通话中", "on");
       } else if (t === "conversation.item.input_audio_transcription.delta") {
         const d = ev.delta || ev.text || "";
         if (d) {
           userPartial += d;
-          // live partial is noisy; only show finals for clarity
+          showPartial("you", userPartial);
         }
       } else if (t === "conversation.item.input_audio_transcription.completed") {
         const text = (ev.transcript || ev.text || userPartial || "").trim();
         userPartial = "";
+        if (partialUserEl) { partialUserEl.remove(); partialUserEl = null; }
         if (text) appendLog("You: " + text, "you");
-      } else if (
-        t === "response.output_audio.delta" || t === "response.audio.delta"
-      ) {
-        if (ev.delta) playPcm16(base64ToInt16(ev.delta));
+      } else if (t === "response.output_audio.delta" || t === "response.audio.delta") {
+        if (ev.delta) player.push(base64ToInt16(ev.delta));
       } else if (
         t === "response.output_audio_transcript.delta" ||
         t === "response.audio_transcript.delta" ||
         t === "response.output_text.delta" ||
         t === "response.text.delta"
       ) {
-        if (ev.delta) assistantBuf += ev.delta;
+        if (ev.delta) {
+          assistantBuf += ev.delta;
+          showPartial("bot", assistantBuf);
+        }
       } else if (
         t === "response.output_audio_transcript.done" ||
         t === "response.audio_transcript.done" ||
         t === "response.output_text.done" ||
         t === "response.text.done"
       ) {
+        player.flush();
         const full = (ev.transcript || ev.text || assistantBuf || "").trim();
         assistantBuf = "";
+        if (partialBotEl) { partialBotEl.remove(); partialBotEl = null; }
         if (full) appendLog("Assistant: " + full, "bot");
       } else if (t === "error") {
         const msg = (ev.error && ev.error.message) || ev.message || JSON.stringify(ev);
@@ -301,27 +698,190 @@
       }
     }
 
+    function escapeHtml(s) {
+      return String(s ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    function productDetailUrl(id) {
+      const origin = backendOrigin();
+      return `${origin}/product?id=${encodeURIComponent(id)}&from=voice-test`;
+    }
+
+    async function enrichRanked(ranked) {
+      const out = [];
+      for (const item of ranked.slice(0, 8)) {
+        const id = String(item.id || "").trim();
+        let full = item;
+        if (id) {
+          if (productCache.has(id)) {
+            full = { ...productCache.get(id), ...item };
+          } else {
+            try {
+              const res = await fetch(`${backendOrigin()}/api/v1/products/${encodeURIComponent(id)}`);
+              if (res.ok) {
+                const data = await res.json();
+                productCache.set(id, data);
+                full = { ...data, ...item, image_url: item.image_url || data.image_url };
+              }
+            } catch (_) {
+              productCache.set(id, item);
+            }
+          }
+        }
+        out.push(full);
+      }
+      return out;
+    }
+
+    function renderProductCards(ranked) {
+      if (!ranked.length) {
+        productCardsEl.innerHTML = `<div class="sys">暂无推荐商品</div>`;
+        return;
+      }
+      productCardsEl.innerHTML = ranked.map((r, i) => {
+        const id = r.id || "";
+        const img = (r.image_url || "").trim();
+        const reasons = Array.isArray(r.reasons) ? r.reasons.join(" · ") : "";
+        const href = id ? productDetailUrl(id) : "#";
+        const thumb = img
+          ? `<img class="thumb" src="${escapeHtml(img)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+          : `<div class="thumb-fallback">No image</div>`;
+        return `
+          <a class="product-card" href="${escapeHtml(href)}" target="_blank" rel="noopener">
+            ${thumb}
+            <div>
+              <div class="name">#${i + 1} ${escapeHtml(r.name || id || "Product")}</div>
+              <div class="price">$${r.price ?? "—"} · score ${r.score ?? "—"}</div>
+              <div class="meta-line">${escapeHtml(id)}${r.rating ? ` · ${r.rating}/5` : ""}</div>
+              ${reasons ? `<div class="reasons">${escapeHtml(reasons)}</div>` : ""}
+            </div>
+          </a>`;
+      }).join("");
+    }
+
+    async function renderRecs(payload) {
+      const status = payload.status || "idle";
+      const message = payload.message || "";
+      document.getElementById("metaWorker").textContent = message
+        ? `${status} — ${message}`
+        : status;
+      const bundle = payload.bundle;
+      if (!bundle) {
+        if (status && status !== "idle") {
+          recsEl.innerHTML = `<div class="sys">Worker: ${status}${message ? " — " + message : ""}</div>`;
+        }
+        return;
+      }
+      const key = JSON.stringify({
+        s: bundle.summary,
+        r: (bundle.ranked || []).slice(0, 3).map((x) => x.id || x.name),
+      });
+      if (key === lastBundleKey) return;
+      lastBundleKey = key;
+      const ranked = bundle.ranked || [];
+      if (!ranked.length) {
+        recsEl.innerHTML = `<div class="sys">${bundle.summary || "暂无推荐"}</div>`;
+        productCardsEl.innerHTML = `<div class="sys">${bundle.summary || "暂无推荐商品"}</div>`;
+        return;
+      }
+      recsEl.innerHTML = "";
+      if (bundle.summary) {
+        const sum = document.createElement("div");
+        sum.className = "sys";
+        sum.textContent = bundle.summary;
+        recsEl.appendChild(sum);
+      }
+      ranked.slice(0, 5).forEach((item, i) => {
+        const card = document.createElement("div");
+        card.className = "rec-card";
+        card.innerHTML =
+          `<strong>${i + 1}. ${escapeHtml(item.name || "Product")}</strong>` +
+          `<span>score ${item.score ?? "—"} · $${item.price ?? "—"} · ${escapeHtml(item.id || "")}</span>`;
+        recsEl.appendChild(card);
+      });
+      const enriched = await enrichRanked(ranked);
+      renderProductCards(enriched);
+      appendLog(`[Worker] 推荐已更新（${ranked.length} 条）· 下方可点卡片看详情`, "sys");
+    }
+
+    function startPolling() {
+      stopPolling();
+      const tick = async () => {
+        if (!sessionId) return;
+        try {
+          const res = await fetch(`${backendOrigin()}/api/v1/session/${sessionId}/recommendations`);
+          if (res.ok) renderRecs(await res.json());
+        } catch (_) {}
+      };
+      tick();
+      pollTimer = setInterval(tick, 1500);
+    }
+
+    function stopPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    async function checkHealth() {
+      try {
+        const res = await fetch(`${backendOrigin()}/health`);
+        const body = await res.json();
+        if (!res.ok) throw new Error("health failed");
+        const talker = body.talker || "?";
+        const keys = [
+          body.openai_key_configured ? "OpenAI✓" : "OpenAI✗",
+          body.qwen_key_configured ? "Qwen✓" : "Qwen✗",
+        ].join(" ");
+        setHealth(`后端 OK · talker=${talker} · ${keys}`, "on");
+      } catch (_) {
+        setHealth("后端不可达 — 请先启动 server.py", "err");
+      }
+    }
+
     async function startCall() {
       btnStart.disabled = true;
+      muted = false;
+      btnMute.textContent = "静音";
+      btnMute.classList.remove("on");
+      lastBundleKey = "";
       setStatus("创建会话…", "");
       appendLog("正在创建 session…", "sys");
       try {
-        const res = await fetch(`${backendOrigin}/api/v1/session`, {
+        await checkHealth();
+        const res = await fetch(`${backendOrigin()}/api/v1/session`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: "{}",
         });
         const body = await res.json();
         if (!res.ok) throw new Error(JSON.stringify(body));
-        const sid = body.session_id;
-        const wsPath = (body.ws_url || "/api/v1/realtime/ws").split("?")[0];
-        const talker = body.talker || (wsPath.includes("/openai/") ? "openai" : "qwen");
+
+        sessionId = body.session_id;
+        const choice = talkerSelect.value;
+        const wsPath = wsPathForTalker(choice, body);
+        const talker =
+          choice === "auto"
+            ? body.talker || (wsPath.includes("/openai/") ? "openai" : "qwen")
+            : choice;
         const interruptionHandling = body.interruption_handling_enabled !== false;
-        inputRate = body.input_audio_sample_rate || (talker === "openai" ? 24000 : 16000);
-        const wsOrigin = backendOrigin.replace("https://", "wss://").replace("http://", "ws://");
-        const wsUrl = `${wsOrigin}${wsPath}?session_id=${sid}`;
+        inputRate = talker === "openai" ? 24000 : 16000;
+
+        document.getElementById("metaSession").textContent = sessionId;
+        document.getElementById("metaTalker").textContent = talker;
+        document.getElementById("metaRate").textContent = String(inputRate);
+        document.getElementById("metaInterrupt").textContent = interruptionHandling ? "on" : "off";
+        document.getElementById("metaWorker").textContent = "starting";
+
+        const wsOrigin = backendOrigin().replace("https://", "wss://").replace("http://", "ws://");
+        const wsUrl = `${wsOrigin}${wsPath}?session_id=${encodeURIComponent(sessionId)}`;
         appendLog(
-          `session_id=${sid} talker=${talker} input=${inputRate}Hz interruptions=${interruptionHandling ? "on" : "off"}`,
+          `session=${sessionId} talker=${talker} path=${wsPath} input=${inputRate}Hz`,
           "sys"
         );
         setStatus("连接 WebSocket…", "");
@@ -329,12 +889,15 @@
         await new Promise((resolve, reject) => {
           ws = new WebSocket(wsUrl);
           ws.onopen = () => resolve();
-          ws.onerror = () => reject(new Error("WebSocket 连接失败"));
+          ws.onerror = () => reject(new Error("WebSocket 连接失败（检查后端与 API Key）"));
           ws.onclose = () => {
             setStatus("已断开", "err");
             btnStart.disabled = false;
             btnStop.disabled = true;
+            btnMute.disabled = true;
             stopMic();
+            stopPolling();
+            player.stop();
           };
           ws.onmessage = (msg) => {
             try { handleEvent(JSON.parse(msg.data)); }
@@ -342,76 +905,52 @@
           };
         });
 
-        if (talker === "qwen") {
-          // Ensure Tina for qwen3.5 (Cherry is rejected by this model).
-          sendJson({
-            type: "session.update",
-            session: {
-              modalities: ["text", "audio"],
-              voice: "Tina",
-              instructions: qwenInstructions(interruptionHandling),
-              input_audio_format: "pcm",
-              output_audio_format: "pcm",
-              input_audio_transcription: { model: "qwen3-asr-flash-realtime", language: "en" },
-              turn_detection: {
-                type: "server_vad",
-                threshold: 0.4,
-                prefix_padding_ms: 300,
-                silence_duration_ms: 800,
-              },
-            },
-          });
-          appendLog("session.update voice=Tina", "sys");
-        }
+        // Backend already sends session.update (instructions / VAD / voice).
+        // Do not override turn_detection here — it fights LOCAL_VAD when enabled.
 
         await startMic();
+        startPolling();
         setStatus("通话中 — 请说话", "on");
-        appendLog("已连接。请对着电脑麦克风说话。", "sys");
+        appendLog("已连接。戴耳机效果最好；可随时打断助手。", "sys");
         btnStop.disabled = false;
+        btnMute.disabled = false;
       } catch (err) {
-        appendLog("启动失败: " + err.message, "sys");
+        appendLog("启动失败: " + (err && err.message ? err.message : err), "sys");
         setStatus("失败", "err");
         btnStart.disabled = false;
         stopCall();
       }
     }
 
-    function qwenInstructions(interruptionHandling) {
-      const base = "You are VoiceShop++, a helpful retail shopping assistant. Always reply in English only. Help clarify product category, budget, must-haves, and constraints. Keep replies short.";
-      if (!interruptionHandling) return base;
-      return `${base}
-
-If a prior assistant message contains [INTERRUPTED], that marker is the cut-off point. The user did not hear anything after that marker.
-
-## Handling interruptions (barge-in)
-
-The user can and will interrupt you mid-sentence. When that happens:
-
-1. You did NOT finish speaking. The user only heard the words up to the point where they cut in - never assume the rest was heard. Never claim or imply you "already mentioned" or "just said" something that came after the cut-off point.
-
-2. Whatever the user says when interrupting is their most current and highest-priority intent. Adopt it immediately and let it override your previous plan or the answer you were in the middle of giving.
-
-3. Be brief. Respond directly to what they now want. Do NOT re-read, recap, or repeat the recommendations or details they already heard before interrupting.
-
-4. Only restate something from the unspoken part if it is essential to the user's new request AND they were cut off before hearing it - and then keep it to a single short clause, not a re-listing.
-
-5. If the interruption is just a backchannel ("uh-huh", "okay", "right", "mm-hmm", "got it") or clearly not addressed to you (background speech, someone else talking), do NOT treat it as a new instruction. Continue naturally from where you were.
-
-Keep every reply short and spoken-style - one or two sentences.`;
-    }
-
     function stopCall() {
+      stopPolling();
       try { if (ws) ws.close(); } catch (_) {}
       ws = null;
+      sessionId = null;
       stopMic();
-      interruptPlayback();
+      player.stop();
+      clearPartials();
+      muted = false;
+      btnMute.textContent = "静音";
+      btnMute.classList.remove("on");
       btnStart.disabled = false;
       btnStop.disabled = true;
+      btnMute.disabled = true;
       setStatus("未连接", "");
+      productCardsEl.innerHTML =
+        `<div class="sys">推荐就绪后会在这里显示图文卡片</div>`;
     }
 
     btnStart.addEventListener("click", startCall);
     btnStop.addEventListener("click", stopCall);
+    btnMute.addEventListener("click", () => {
+      muted = !muted;
+      btnMute.textContent = muted ? "取消静音" : "静音";
+      btnMute.classList.toggle("on", muted);
+      appendLog(muted ? "[mic] 已静音" : "[mic] 取消静音", "sys");
+    });
+    backendInput.addEventListener("change", checkHealth);
+    checkHealth();
   </script>
 </body>
 </html>

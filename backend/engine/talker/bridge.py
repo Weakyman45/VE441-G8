@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from ..bus import EventBus
 from ..events import Event, EventType
-from ..intent import extract_preference
+from ..intent import classify_preference_change, extract_preference
 from ..logging_store import LoggingStore
 from ..realtime_map import (
     RT_INPUT_TRANSCRIPT_DONE,
@@ -76,6 +76,9 @@ class TalkerBridge:
         self._truncated_assistant_item_ids: set[str] = set()
         self._ignore_next_assistant_done = False
         self._inject_timer: threading.Timer | None = None
+        self._assistant_speaking = False
+        self._pending_worker_speak: str | None = None
+        self._pending_run_id: int | None = None
         self.sessions.require(session_id)
         bus.subscribe(EventType.WORKER_RECOMMENDATION_READY, self._on_recommendation)
 
@@ -124,6 +127,8 @@ class TalkerBridge:
         et = frame.get("type")
         if et == RT_SPEECH_STARTED:
             self._last_interrupt_at = time.time()
+            self._pending_worker_speak = None
+            self._pending_run_id = None
             if self._inject_timer is not None:
                 self._inject_timer.cancel()
                 self._inject_timer = None
@@ -137,6 +142,18 @@ class TalkerBridge:
                     },
                 )
             )
+            return
+        if et == "response.created":
+            self._assistant_speaking = True
+            return
+        if et in (
+            "response.done",
+            "response.cancelled",
+            "response.failed",
+            "response.completed",
+        ):
+            self._assistant_speaking = False
+            self._schedule_pending_worker_speak(delay_s=0.15)
             return
         if et in ("response.output_item.added", "response.output_item.created"):
             item = frame.get("item") or {}
@@ -217,7 +234,9 @@ class TalkerBridge:
         state = self.sessions.require(self.session_id)
         self.sessions.append_turn(self.session_id, "user", text)
         self.logs.log_conversation(self.session_id, "user", text)
-        preference = extract_preference(text, state.preference)
+        prior = state.preference
+        preference = extract_preference(text, prior)
+        change_kind = classify_preference_change(prior, preference)
         self.sessions.update_preference(self.session_id, preference)
         risk = assess_shopping_risk(text) if shopping_safety_enabled() else RiskAssessment()
         self.sessions.update_risk(self.session_id, risk.category, risk.reasons)
@@ -227,6 +246,7 @@ class TalkerBridge:
             "intent_updated",
             {
                 **preference.to_dict(),
+                "change_kind": change_kind,
                 "risk_category": risk.category,
                 "risk_reasons": risk.reasons,
                 **({"source": source} if source else {}),
@@ -253,6 +273,9 @@ class TalkerBridge:
             intent_payload["source"] = source
         intent_payload["risk_category"] = risk.category
         intent_payload["risk_reasons"] = risk.reasons
+        intent_payload["change_kind"] = change_kind
+        intent_payload["raw_query"] = text
+        intent_payload["utterance"] = text
         self.bus.emit(
             Event(
                 type=EventType.USER_UTTERANCE,
@@ -260,6 +283,16 @@ class TalkerBridge:
                 payload=utterance_payload,
             )
         )
+        # Soft-only followups with no material change still refresh conversation,
+        # but skip kicking a new Worker run (avoids cancel storms while Talker chats).
+        if change_kind == "none" and state.worker.last_bundle:
+            self.logs.log_trace(
+                self.session_id,
+                "talker",
+                "intent_skipped_worker",
+                {"change_kind": change_kind, "reason": "no_material_preference_change"},
+            )
+            return
         self.bus.emit(
             Event(
                 type=EventType.USER_INTENT_UPDATED,
@@ -366,32 +399,102 @@ class TalkerBridge:
         if event.session_id != self.session_id:
             return
         bundle = event.payload or {}
-        summary = bundle.get("summary") or "I updated your matches."
-        ranked = bundle.get("ranked") or []
-        lines = [summary]
-        for i, item in enumerate(ranked[:3], 1):
-            lines.append(
-                f"{i}. {item.get('name')} — score {item.get('score')}, "
-                f"about {item.get('price')}."
+        run_id = bundle.get("run_id")
+        state = self.sessions.require(self.session_id)
+        if run_id is not None and int(run_id) != int(state.worker.run_id):
+            self.logs.log_trace(
+                self.session_id,
+                "talker",
+                "stale_recommendation_dropped",
+                {"run_id": run_id, "current_run_id": state.worker.run_id},
             )
-        spoken = " ".join(lines)
-        # Delay inject so we don't stomp an in-progress reply / barge-in window.
+            return
+        # Prefer structured Talker brief (recommendation + conflicts/tradeoffs).
+        spoken = (bundle.get("talker_brief") or "").strip()
+        if not spoken:
+            summary = bundle.get("summary") or "I updated your matches."
+            ranked = bundle.get("ranked") or []
+            lines = [summary]
+            for i, item in enumerate(ranked[:3], 1):
+                lines.append(
+                    f"{i}. {item.get('name')} — score {item.get('score')}, "
+                    f"about {item.get('price')}."
+                )
+            conflicts = bundle.get("conflicts") or []
+            violated = [
+                c for c in conflicts
+                if isinstance(c, dict) and c.get("status") == "violated"
+            ][:2]
+            if violated:
+                bits = [
+                    f"{c.get('product_name') or 'one option'}: {c.get('constraint')}"
+                    for c in violated
+                ]
+                lines.append("I filtered some options — " + "; ".join(bits) + ".")
+            questions = bundle.get("open_questions") or []
+            if questions:
+                lines.append(str(questions[0]))
+            spoken = " ".join(lines)
+        self.logs.log_trace(
+            self.session_id,
+            "talker",
+            "recommendation_brief",
+            {
+                "run_id": run_id,
+                "conflicts": len(bundle.get("conflicts") or []),
+                "open_questions": len(bundle.get("open_questions") or []),
+                "brief": spoken[:300],
+            },
+        )
+        self._pending_worker_speak = spoken
+        self._pending_run_id = int(run_id) if run_id is not None else state.worker.run_id
+        # Wait until the Talker finishes its current utterance so Worker notes
+        # do not response.cancel mid-sentence (that sounded choppy on web/Android).
+        delay = 0.2 if not self._assistant_speaking else 0.05
+        self._schedule_pending_worker_speak(delay_s=delay)
+
+    def _schedule_pending_worker_speak(self, *, delay_s: float) -> None:
         if self._inject_timer is not None:
             self._inject_timer.cancel()
-        timer = threading.Timer(2.5, lambda: self._inject_assistant_speak(spoken))
+            self._inject_timer = None
+        if not self._pending_worker_speak:
+            return
+        timer = threading.Timer(delay_s, self._flush_pending_worker_speak)
         timer.daemon = True
         self._inject_timer = timer
         timer.start()
+
+    def _flush_pending_worker_speak(self) -> None:
+        spoken = self._pending_worker_speak
+        run_id = self._pending_run_id
+        if not spoken:
+            return
+        if self._assistant_speaking:
+            # Still talking — retry shortly instead of cancelling mid-utterance.
+            self._schedule_pending_worker_speak(delay_s=0.35)
+            return
+        if time.time() - self._last_interrupt_at < 2.0:
+            self._schedule_pending_worker_speak(delay_s=0.5)
+            return
+        state = self.sessions.require(self.session_id)
+        if run_id is not None and int(run_id) != int(state.worker.run_id):
+            self._pending_worker_speak = None
+            self._pending_run_id = None
+            return
+        self._pending_worker_speak = None
+        self._pending_run_id = None
+        self._inject_assistant_speak(spoken)
 
     def _inject_assistant_speak(self, spoken: str) -> None:
         send = self._send_upstream
         if not send:
             return
         # Skip if the user barged in recently — let them finish their turn.
-        if time.time() - self._last_interrupt_at < 4.0:
+        if time.time() - self._last_interrupt_at < 2.0:
             return
-        # Official Realtime client events
-        send({"type": "response.cancel"})
+        # Only cancel if a response somehow started again; prefer idle inject.
+        if self._assistant_speaking:
+            send({"type": "response.cancel"})
         send(
             {
                 "type": "conversation.item.create",
@@ -402,8 +505,9 @@ class TalkerBridge:
                         {
                             "type": "input_text",
                             "text": (
-                                "[Worker recommendation ready — speak this naturally in one short turn, "
-                                "do not invent other products]\n" + spoken
+                                "[Worker recommendation ready — speak this naturally in one short turn. "
+                                "Include any constraint conflicts, trade-offs, or clarifying questions. "
+                                "Do not invent other products]\n" + spoken
                             ),
                         }
                     ],
@@ -411,3 +515,4 @@ class TalkerBridge:
             }
         )
         send({"type": "response.create"})
+        self._assistant_speaking = True

@@ -105,11 +105,13 @@ class WorkerRuntime:
             self._cancel[session_id] = cancel
 
         cfg = load_config()
-        state = self.sessions.require(session_id)
         payload = trigger.payload or {}
         utterance = str(payload.get("raw_query") or payload.get("utterance") or "")
         user_id = str(payload.get("user_id") or "") or None
         opted_in = bool(payload.get("opted_in_memory"))
+        change_kind = str(payload.get("change_kind") or "").strip().lower() or None
+        run_id = self.sessions.bump_worker_run(session_id)
+        state = self.sessions.require(session_id)
 
         attempt = 0
         replan_ctx: dict[str, Any] | None = None
@@ -120,7 +122,9 @@ class WorkerRuntime:
                 return
 
             t0 = time.time()
-            self.sessions.set_worker_status(session_id, "planning", "Planning tasks")
+            self.sessions.set_worker_status(
+                session_id, "planning", "Planning tasks", run_id=run_id
+            )
             plan = planner.plan(
                 state,
                 utterance=utterance or None,
@@ -129,10 +133,11 @@ class WorkerRuntime:
                 replan_ctx=replan_ctx,
                 memory=self.memory,
                 config=cfg,
+                change_kind=change_kind,
             )
             plan_id = plan["plan_id"]
             self.sessions.set_worker_status(
-                session_id, "planning", "Plan ready", plan_id=plan_id
+                session_id, "planning", "Plan ready", plan_id=plan_id, run_id=run_id
             )
             self.logs.log_trace(
                 session_id,
@@ -237,6 +242,19 @@ class WorkerRuntime:
                     "idle",
                     exec_result.error or "Execution failed",
                     plan_id=plan_id,
+                    run_id=run_id,
+                )
+                return
+
+            # Drop results if a newer preference update superseded this run.
+            latest = self.sessions.require(session_id)
+            if cancel.is_set() or latest.worker.run_id != run_id:
+                self.logs.log_trace(
+                    session_id,
+                    "runtime",
+                    "stale_run_dropped",
+                    {"run_id": run_id, "current_run_id": latest.worker.run_id},
+                    plan_id=plan_id,
                 )
                 return
 
@@ -246,6 +264,7 @@ class WorkerRuntime:
                     session_id=session_id,
                     payload={
                         "plan_id": plan_id,
+                        "run_id": run_id,
                         "count": len(exec_result.candidates),
                         "rejected": len(exec_result.rejected),
                     },
@@ -260,14 +279,21 @@ class WorkerRuntime:
                 session_id,
                 "recommend",
                 "recommendation_ready",
-                {"top": [r.id for r in bundle.ranked], "summary": bundle.summary},
+                {
+                    "top": [r.id for r in bundle.ranked],
+                    "summary": bundle.summary,
+                    "run_id": run_id,
+                    "change_kind": change_kind or "",
+                },
                 plan_id=plan_id,
             )
+            ready_payload = bundle.to_dict()
+            ready_payload["run_id"] = run_id
             self.bus.emit(
                 Event(
                     type=EventType.WORKER_RECOMMENDATION_READY,
                     session_id=session_id,
-                    payload=bundle.to_dict(),
+                    payload=ready_payload,
                 )
             )
             self.bus.emit(
@@ -278,6 +304,7 @@ class WorkerRuntime:
                         "status": "ready",
                         "message": bundle.summary,
                         "plan_id": plan_id,
+                        "run_id": run_id,
                     },
                 )
             )

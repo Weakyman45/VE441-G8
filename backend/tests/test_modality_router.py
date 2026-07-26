@@ -81,7 +81,8 @@ class TestRoute(unittest.TestCase):
     def test_image_route(self):
         p = mr.route(session(text="[image uploaded]", image=True), cfg())
         self.assertEqual(p.modality, mr.MODALITY_IMAGE)
-        self.assertFalse(p.do_text_recall)
+        # A_I fills keywords, then text ∥ visual recall.
+        self.assertTrue(p.do_text_recall)
         self.assertTrue(p.do_visual_recall)
         self.assertTrue(p.infer_category_from_image)
         self.assertTrue(p.reverse_verify)

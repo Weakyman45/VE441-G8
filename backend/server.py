@@ -41,7 +41,7 @@ from ws_proxy import UpstreamSender, connect_openai_realtime, relay_sockets, ws_
 
 from engine.bus import EventBus
 from engine.events import Event, EventType
-from engine.intent import extract_preference
+from engine.intent import classify_preference_change, extract_preference
 from engine.logging_store import LoggingStore
 from engine.llm.analyze import analyze_need, analyze_need_stream
 from engine.llm.vision import describe_shopping_image, visual_context_text
@@ -63,6 +63,8 @@ ENV_FILE = os.path.join(HERE, ".env")
 FALLBACK_OPENAI_ENV_FILE = "/Users/YukiWang/Downloads/tau2-bench-dev-tau3/.env"
 ENGINE_LOG_DB = os.path.join(HERE, "data", "engine_logs.db")
 VOICE_TEST_HTML = os.path.join(HERE, "static", "voice_test.html")
+CHAT_TEST_HTML = os.path.join(HERE, "static", "chat_test.html")
+PRODUCT_HTML = os.path.join(HERE, "static", "product.html")
 UPLOAD_DIR = os.path.join(HERE, "data", "uploads")
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
@@ -95,13 +97,32 @@ def load_dotenv(path: str = ENV_FILE, *, override: bool = True) -> None:
 load_dotenv()
 load_dotenv(FALLBACK_OPENAI_ENV_FILE, override=False)
 
+def _looks_like_placeholder_key(value: str) -> bool:
+    """Treat .env.example-style placeholders as unset so auto can fall back."""
+    v = (value or "").strip().lower()
+    if not v:
+        return True
+    return (
+        "your" in v
+        or "example" in v
+        or "changeme" in v
+        or v.endswith("-key")
+        or v in {"sk-xxx", "sk-test", "none", "null", "todo"}
+    )
+
+
+def _env_api_key(name: str) -> str:
+    raw = (os.environ.get(name) or "").strip()
+    return "" if _looks_like_placeholder_key(raw) else raw
+
+
 # Re-read after dotenv so later code sees the file values.
-DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "").strip()
+DASHSCOPE_API_KEY = _env_api_key("DASHSCOPE_API_KEY")
 QWEN_OMNI_MODEL = (
     os.environ.get("QWEN_OMNI_MODEL") or "qwen3.5-omni-flash-realtime"
 ).strip()
 QWEN_OMNI_VOICE = (os.environ.get("QWEN_OMNI_VOICE") or "Tina").strip()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_API_KEY = _env_api_key("OPENAI_API_KEY")
 OPENAI_API_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
 REALTIME_MODEL = (
     os.environ.get("OPENAI_REALTIME_MODEL_OVERRIDE")
@@ -199,12 +220,21 @@ SHOPPING_INSTRUCTIONS = build_shopping_instructions()
 
 
 def resolve_talker_provider(requested: str | None = None) -> str:
-    """Resolve Talker provider with GPT Realtime preferred and Qwen as fallback."""
+    """Resolve Talker provider with GPT Realtime preferred and Qwen as fallback.
+
+    Placeholder keys (e.g. sk-your-...-key from .env.example) count as unset.
+    Fallback is config-time only: invalid-but-nonempty real keys still need a
+    provider switch or a corrected key.
+    """
     wanted = (requested or TALKER_PROVIDER_REQUESTED or "auto").strip().lower()
     if wanted in ("gpt", "gpt-realtime", "gpt_realtime"):
         wanted = "openai"
     if wanted in ("auto", "default", ""):
-        return "openai" if OPENAI_API_KEY else "qwen"
+        if OPENAI_API_KEY:
+            return "openai"
+        if DASHSCOPE_API_KEY:
+            return "qwen"
+        return "openai"  # keep previous default; WS layer will report missing key
     if wanted == "openai" and not OPENAI_API_KEY and DASHSCOPE_API_KEY:
         return "qwen"
     if wanted == "qwen" and not DASHSCOPE_API_KEY and OPENAI_API_KEY:
@@ -516,6 +546,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_bytes(200, body, "text/html; charset=utf-8")
 
+    def _send_chat_test(self) -> None:
+        try:
+            with open(CHAT_TEST_HTML, "rb") as fh:
+                body = fh.read()
+        except OSError as exc:
+            self._send(500, {"error": "chat_test_missing", "detail": str(exc)})
+            return
+        self._send_bytes(200, body, "text/html; charset=utf-8")
+
+    def _send_product_page(self) -> None:
+        try:
+            with open(PRODUCT_HTML, "rb") as fh:
+                body = fh.read()
+        except OSError as exc:
+            self._send(500, {"error": "product_page_missing", "detail": str(exc)})
+            return
+        self._send_bytes(200, body, "text/html; charset=utf-8")
+
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -729,15 +777,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 state = SESSION_STORE.create_or_get(sid)
+                prior = state.preference
                 combined_text = text
-                if state.preference.visual_context:
+                if prior.visual_context:
                     combined_text = (
                         f"{text}\n\nImage context already attached: "
-                        f"{state.preference.visual_context}"
+                        f"{prior.visual_context}"
                     )
-                updated = extract_preference(combined_text, state.preference)
-                if state.preference.visual_context and not updated.visual_context:
-                    updated.visual_context = state.preference.visual_context
+                updated = extract_preference(combined_text, prior)
+                if prior.visual_context and not updated.visual_context:
+                    updated.visual_context = prior.visual_context
 
                 # Every text (incl. transcribed voice) is analyzed by the LLM.
                 # If the session has uploaded image(s), send them together with
@@ -745,25 +794,35 @@ class Handler(BaseHTTPRequestHandler):
                 # pre-extracted keywords).
                 session_images = _session_image_data_urls(state)
                 analysis = analyze_need(
-                    text, prior=state.preference.to_dict(), images=session_images
+                    text, prior=prior.to_dict(), images=session_images
                 )
                 if analysis.get("provider") == "qwen":
                     _merge_llm_analysis(updated, analysis)
 
+                change_kind = classify_preference_change(prior, updated)
                 SESSION_STORE.update_preference(sid, updated)
                 SESSION_STORE.append_turn(sid, "user", text)
                 LOG_STORE.log_conversation(sid, "user", text)
                 LOG_STORE.log_trace(sid, "text", "intent_updated", {
-                    **updated.to_dict(), "llm_provider": analysis.get("provider"),
+                    **updated.to_dict(),
+                    "change_kind": change_kind,
+                    "llm_provider": analysis.get("provider"),
                 })
                 EVENT_BUS.emit(Event(
                     type=EventType.USER_INTENT_UPDATED,
                     session_id=sid,
-                    payload={**updated.to_dict(), "source": {"type": "text_input"}},
+                    payload={
+                        **updated.to_dict(),
+                        "change_kind": change_kind,
+                        "raw_query": text,
+                        "utterance": text,
+                        "source": {"type": "text_input"},
+                    },
                 ))
                 self._send(200, {
                     "session_id": sid,
                     "preference": updated.to_dict(),
+                    "change_kind": change_kind,
                     "visual_context": updated.visual_context,
                     "analysis": analysis,
                 })
@@ -798,6 +857,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path in ("/voice-test", "/voice_test", "/voice-test.html"):
                 self._send_voice_test()
+            elif path in ("/chat-test", "/chat_test", "/chat-test.html"):
+                self._send_chat_test()
+            elif path in ("/product", "/product.html"):
+                self._send_product_page()
             elif path == "/health" or path == "":
                 self._send(200, {
                     "status": "ok",
@@ -814,6 +877,8 @@ class Handler(BaseHTTPRequestHandler):
                     "engine": "talker-worker",
                     "llm": "qwen",
                     "voice_test": "/voice-test",
+                    "chat_test": "/chat-test",
+                    "product_page": "/product",
                 })
             elif path == "/api/v1/search":
                 self._send(200, {"results": search(params)})
@@ -1153,6 +1218,7 @@ def main() -> None:
     print("WS Qwen:    /api/v1/qwen/realtime/ws")
     print("WS OpenAI:  /api/v1/openai/realtime/ws")
     print("PC voice:   http://127.0.0.1:%s/voice-test" % args.port)
+    print("PC chat:    http://127.0.0.1:%s/chat-test" % args.port)
     if os.path.isfile(ENV_FILE):
         print(f"Loaded local secrets from {ENV_FILE}")
     if os.path.isfile(FALLBACK_OPENAI_ENV_FILE):

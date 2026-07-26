@@ -49,6 +49,10 @@ class RecommendationBundle:
     excluded: list[dict[str, str]] = field(default_factory=list)
     summary: str = ""
     status: str = "ready"
+    conflicts: list[dict[str, Any]] = field(default_factory=list)
+    tradeoffs: list[dict[str, Any]] = field(default_factory=list)
+    open_questions: list[str] = field(default_factory=list)
+    talker_brief: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +61,10 @@ class RecommendationBundle:
             "excluded": self.excluded,
             "summary": self.summary,
             "status": self.status,
+            "conflicts": self.conflicts,
+            "tradeoffs": self.tradeoffs,
+            "open_questions": self.open_questions,
+            "talker_brief": self.talker_brief,
         }
 
 
@@ -66,12 +74,15 @@ class WorkerState:
     status: str = "idle"  # idle | planning | searching | recommending | ready | cancelled
     last_bundle: RecommendationBundle | None = None
     message: str = ""
+    # Monotonic id for the latest pipeline run; Talker drops stale recommendation injects.
+    run_id: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "plan_id": self.plan_id,
             "status": self.status,
             "message": self.message,
+            "run_id": self.run_id,
             "last_bundle": self.last_bundle.to_dict() if self.last_bundle else None,
         }
 

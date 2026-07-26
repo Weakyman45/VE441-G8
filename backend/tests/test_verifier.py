@@ -118,7 +118,7 @@ class TestVerifier(unittest.TestCase):
         r = verifier.verify_candidates(PreferenceProfile(category="shoes"),
                                        [item("1", "white running shoes")], cfg("rule"))
         d = r.to_dict()
-        self.assertEqual(set(d), {"kept", "rejected", "method"})
+        self.assertEqual(set(d), {"kept", "rejected", "method", "conflicts", "unresolved"})
 
 
 if __name__ == "__main__":

@@ -8,8 +8,14 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ..conflicts import ConflictPacket
 from ..exp_config import CONFIG, ExpConfig, load_config
-from ..models import PreferenceProfile, RankedProduct, RecommendationBundle, SessionState
+from ..models import PreferenceProfile, RecommendationBundle, SessionState
+from ..query_fusion import (
+    apply_image_attributes,
+    fuse_text_image_query,
+    normalize_fuse_weights,
+)
 from ..verifier import verify_candidates
 from .plan_schema import (
     AGENT_RECOMMEND,
@@ -29,6 +35,7 @@ class ExecuteResult:
     bundle: RecommendationBundle | None = None
     candidates: list[dict[str, Any]] = field(default_factory=list)
     rejected: list[dict[str, Any]] = field(default_factory=list)
+    conflicts: list[dict[str, Any]] = field(default_factory=list)
     need_replan: bool = False
     reject_reason: str = ""
     memory_writes: list[dict[str, Any]] = field(default_factory=list)
@@ -41,6 +48,7 @@ class ExecuteResult:
             "bundle": self.bundle.to_dict() if self.bundle else None,
             "candidate_count": len(self.candidates),
             "rejected": self.rejected,
+            "conflicts": self.conflicts,
             "need_replan": self.need_replan,
             "reject_reason": self.reject_reason,
             "memory_writes": self.memory_writes,
@@ -83,6 +91,8 @@ class Executor:
         text_cands: list[dict] = []
         visual_cands: list[dict] = []
         candidates: list[dict] = []
+        verify_conflicts: list = []
+        verify_unresolved: list = []
         focus_ids = _focus_ids(plan)
         query_hint = (
             plan.get("query_hint")
@@ -90,6 +100,23 @@ class Executor:
             or ""
         )
         query_image = _load_query_image(state)
+        decision = plan.get("decision") or {}
+        route = decision.get("route") or {}
+        modality = str(route.get("modality") or "text")
+        hints = plan.get("hints") or {}
+        fuse_weights = normalize_fuse_weights(
+            hints.get("fuse_weights") or decision.get("fuse_weights"),
+            modality=modality,
+        )
+
+        # A_I / F_VL before recall so keywords & category are ready.
+        if query_image and not _is_shortcircuit(stages):
+            if bool(route.get("infer_category_from_image")) or modality == "image":
+                meta = apply_image_attributes(state, query_image)
+                result.stage_trace.append({"agent": "a_i", **{k: meta.get(k) for k in ("ok", "category", "keywords", "warning")}})
+            elif modality in ("text_image", "text+image"):
+                meta = fuse_text_image_query(state, query_image)
+                result.stage_trace.append({"agent": "f_vl", **{k: meta.get(k) for k in ("ok", "category", "keywords", "warning")}})
 
         for stage in stages:
             if cancel.is_set():
@@ -99,33 +126,24 @@ class Executor:
             params = stage.get("params") or {}
             try:
                 if agent == AGENT_TEXT_RECALL:
-                    # Prefer planner query_hint by temporarily injecting keywords if empty.
                     pref = state.preference
                     if query_hint and not pref.search_keywords:
-                        pref = PreferenceProfile(**{**pref.to_dict(), "search_keywords": query_hint.split()})
+                        pref = PreferenceProfile(
+                            **{**pref.to_dict(), "search_keywords": query_hint.split()}
+                        )
                     text_cands = run_search(
                         pref,
                         self.search_fn,
                         query_hint=params.get("query_hint") or query_hint,
                     )
+                    for c in text_cands:
+                        c.setdefault("_text_score", 1.0)
                     result.stage_trace.append({"agent": agent, "count": len(text_cands)})
                 elif agent == AGENT_VISUAL_RECALL:
-                    from ..modality_router import RoutePlan
-
-                    route = RoutePlan(
-                        modality=str((plan.get("decision") or {}).get("route", {}).get("modality") or "text"),
-                        do_text_recall=False,
-                        do_visual_recall=True,
-                        infer_category_from_image=bool(params.get("infer_category_from_image")),
-                        reverse_verify=False,
-                        do_verify=False,
-                        reason="executor-visual",
-                    )
-                    visual_cands = self.recall.image_recall(
-                        query_image,
-                        state.preference.category if route.infer_category_from_image else None,
-                        cfg,
-                    )
+                    cat = None
+                    if params.get("infer_category_from_image") or modality == "image":
+                        cat = state.preference.category or None
+                    visual_cands = self.recall.image_recall(query_image, cat, cfg)
                     result.stage_trace.append({"agent": agent, "count": len(visual_cands)})
                 elif agent == AGENT_VERIFY:
                     candidates = _merge(text_cands, visual_cands) if not candidates else candidates
@@ -139,15 +157,30 @@ class Executor:
                                 )
                         except Exception:
                             pass
-                    verified = verify_candidates(state.preference, candidates, cfg)
+                    reverse = bool(params.get("reverse_verify") or route.get("reverse_verify"))
+                    verified = verify_candidates(
+                        state.preference,
+                        candidates,
+                        cfg,
+                        reverse_verify=reverse,
+                    )
                     candidates = list(verified.kept)
-                    result.rejected = list(verified.rejected)
+                    result.rejected = list(getattr(verified, "rejected", None) or [])
+                    verify_conflicts = list(getattr(verified, "conflicts", None) or [])
+                    verify_unresolved = list(getattr(verified, "unresolved", None) or [])
+                    result.conflicts = [
+                        c.to_dict() if hasattr(c, "to_dict") else c
+                        for c in verify_conflicts
+                    ]
                     result.stage_trace.append(
                         {
                             "agent": agent,
                             "kept": len(candidates),
                             "rejected": len(result.rejected),
+                            "conflicts": len(verify_conflicts),
+                            "unresolved": len(verify_unresolved),
                             "method": verified.method,
+                            "reverse_verify": reverse,
                         }
                     )
                     if not candidates and result.rejected:
@@ -159,24 +192,52 @@ class Executor:
                             return result
                 elif agent == AGENT_RECOMMEND:
                     candidates = _merge(text_cands, visual_cands) if not candidates else candidates
+                    if query_image and candidates:
+                        try:
+                            from .. import enrichment
+
+                            if enrichment.has_enrichment():
+                                enrichment.attach_visual_scores(
+                                    candidates, query_image[0], mime=query_image[1]
+                                )
+                        except Exception:
+                            pass
                     result.candidates = candidates
-                    bundle = rank_products(plan["plan_id"], state.preference, candidates)
+                    bundle = rank_products(
+                        plan["plan_id"],
+                        state.preference,
+                        candidates,
+                        fuse_weights=fuse_weights,
+                        modality=modality,
+                        conflicts=verify_conflicts,
+                        unresolved=verify_unresolved,
+                    )
                     if focus_ids:
                         bundle = _boost_focus(bundle, focus_ids)
                     result.bundle = bundle
+                    result.conflicts = list(bundle.conflicts or result.conflicts)
                     result.ok = True
                     result.stage_trace.append(
-                        {"agent": agent, "top": [r.id for r in bundle.ranked[:5]]}
+                        {
+                            "agent": agent,
+                            "top": [r.id for r in bundle.ranked[:5]],
+                            "fuse_weights": fuse_weights,
+                        }
                     )
                 elif agent == AGENT_RERANK_EXISTING:
                     bundle = _rerank_existing(
-                        plan["plan_id"], state, focus_ids=focus_ids
+                        plan["plan_id"],
+                        state,
+                        focus_ids=focus_ids,
+                        fuse_weights=fuse_weights,
+                        modality=modality,
                     )
                     result.bundle = bundle
                     result.candidates = [
                         {"id": r.id, "name": r.name, "price": r.price}
                         for r in (bundle.ranked if bundle else [])
                     ]
+                    result.conflicts = list(bundle.conflicts or [])
                     result.ok = True
                     result.stage_trace.append(
                         {
@@ -196,7 +257,6 @@ class Executor:
             except Exception:
                 result.memory_writes = []
         elif result.ok and result.bundle:
-            # Minimal default writeback: refresh last_ranked for reference resolution.
             result.memory_writes = [
                 {
                     "key": "last_ranked",
@@ -207,12 +267,15 @@ class Executor:
                     "scope": "session",
                 }
             ]
-            # Merge planner-declared writes.
             planned = (plan.get("writeback") or {}).get("memory_write") or []
             if isinstance(planned, list):
                 result.memory_writes = planned + result.memory_writes
 
         return result
+
+
+def _is_shortcircuit(stages: list[dict[str, Any]]) -> bool:
+    return any(str(s.get("agent") or "") == AGENT_RERANK_EXISTING for s in stages)
 
 
 def _focus_ids(plan: dict[str, Any]) -> list[str]:
@@ -261,6 +324,8 @@ def _rerank_existing(
     state: SessionState,
     *,
     focus_ids: list[str] | None = None,
+    fuse_weights: dict[str, float] | None = None,
+    modality: str = "text",
 ) -> RecommendationBundle:
     prev = state.worker.last_bundle
     if not prev or not prev.ranked:
@@ -269,8 +334,8 @@ def _rerank_existing(
             ranked=[],
             summary="No previous matches to refine.",
             status="ready",
+            talker_brief="No previous matches to refine. Tell me what to change.",
         )
-    # Convert ranked products back to candidate dicts for scoring.
     candidates = [
         {
             "id": r.id,
@@ -289,11 +354,21 @@ def _rerank_existing(
     if focus_ids:
         focused = [c for c in candidates if str(c["id"]) in set(focus_ids)]
         if focused:
-            # Keep focus items first, then the rest for context.
             rest = [c for c in candidates if str(c["id"]) not in set(focus_ids)]
             candidates = focused + rest
-    bundle = rank_products(plan_id, state.preference, candidates, top_n=max(6, len(candidates)))
-    return bundle
+    return rank_products(
+        plan_id,
+        state.preference,
+        candidates,
+        top_n=max(6, len(candidates)),
+        fuse_weights=fuse_weights,
+        modality=modality,
+        conflicts=[
+            ConflictPacket.from_dict(c)
+            for c in (prev.conflicts or [])
+            if isinstance(c, dict)
+        ],
+    )
 
 
 def _load_query_image(state: SessionState) -> tuple[bytes, str] | None:
