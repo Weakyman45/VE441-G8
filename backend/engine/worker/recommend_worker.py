@@ -10,21 +10,34 @@ def rank_products(
     plan_id: str,
     profile: PreferenceProfile,
     candidates: list[dict[str, Any]],
-    top_n: int = 3,
+    top_n: int = 40,
 ) -> RecommendationBundle:
-    scored: list[tuple[int, dict[str, Any], list[str]]] = []
+    query_tokens = _keyword_tokens(profile.search_keywords)
+    scored: list[tuple[int, int, dict[str, Any], list[str]]] = []
     excluded: list[dict[str, str]] = []
     for item in candidates:
         score, reasons, exclude_reason = _score(profile, item)
         if exclude_reason:
             excluded.append({"id": str(item.get("id", "")), "reason": exclude_reason})
             continue
-        scored.append((score, item, reasons))
-    scored.sort(key=lambda x: (-x[0], x[1].get("price") or 10**9))
+        # Relevance = how many specific product words appear in the name. This is
+        # the PRIMARY ranking signal: a genuine match must outrank a merely
+        # high-rated item, otherwise ratings saturate the score cap and cheap
+        # irrelevant products win the tiebreak.
+        name = str(item.get("name") or "").lower()
+        relevance = sum(1 for t in query_tokens if t in name)
+        scored.append((relevance, score, item, reasons))
+    # Sort by relevance first, then quality score, then price ascending.
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2].get("price") or 10**9))
+    # Show ALL genuinely relevant products (name matched >=1 specific product
+    # word), not just a fixed top-3. Only when nothing matched the keywords do
+    # we fall back to a small set so the screen is not empty.
+    relevant = [t for t in scored if t[0] >= 1]
+    selected = (relevant if relevant else scored[:6])[:top_n]
     ranked = [
         RankedProduct(
             id=str(item.get("id", "")),
-            name=str(item.get("name") or "Laptop"),
+            name=str(item.get("name") or "Product"),
             price=int(item.get("price") or 0),
             score=score,
             reasons=reasons[:4],
@@ -34,8 +47,9 @@ def rank_products(
             display=str(item.get("display") or ""),
             performance=str(item.get("performance") or ""),
             weight_kg=float(item.get("weight_kg") or 0),
+            image_url=str(item.get("image_url") or ""),
         )
-        for score, item, reasons in scored[:top_n]
+        for relevance, score, item, reasons in selected
     ]
     summary = _summary(profile, ranked)
     if ranked and qwen_configured():
@@ -69,8 +83,9 @@ def _qwen_summary(
                 {
                     "role": "system",
                     "content": (
-                        "You are the Recommend Worker for VoiceShop++. "
-                        "Write 1–3 short spoken sentences summarizing ONLY these ranked laptops. "
+                        "You are the Recommend Worker for VoiceShop++, a general-purpose "
+                        "shopping assistant (any product category). "
+                        "Write 1–3 short spoken sentences summarizing ONLY these ranked products. "
                         "Match the user's language (Chinese if they spoke Chinese). "
                         "Do not invent products or prices."
                     ),
@@ -121,6 +136,16 @@ def _score(profile: PreferenceProfile, item: dict[str, Any]) -> tuple[int, list[
     haystack = " ".join(
         str(item.get(k) or "") for k in ("name", "summary", "display", "performance", "platform")
     ).lower()
+    # Reward products whose NAME contains the specific product WORDS from the
+    # search keywords. Match individual tokens (not whole phrases) and drop
+    # generic color/adjective words, so a real "running shoe" outranks a
+    # "neutral color" hair clip. Weighted heavily so relevance beats raw rating.
+    name = str(item.get("name") or "").lower()
+    query_tokens = _keyword_tokens(profile.search_keywords)
+    matched = sorted({t for t in query_tokens if t in name})
+    if matched:
+        score += min(30, 8 * len(matched))
+        reasons.append("Matches: " + ", ".join(matched)[:60])
     for token in _important_tokens(profile.visual_context):
         if token in haystack:
             score += 3
@@ -141,8 +166,36 @@ def _score(profile: PreferenceProfile, item: dict[str, Any]) -> tuple[int, list[
     if rating >= 4.5:
         reasons.append(f"Well reviewed ({rating})")
     if not reasons:
-        reasons.append("Matches your laptop search")
+        reasons.append("Matches your search")
     return max(60, min(99, score)), reasons, None
+
+
+# Generic color / adjective words that match almost anything in an English
+# catalog and therefore must NOT count as relevance signal on their own.
+_GENERIC_WORDS = {
+    "white", "black", "red", "blue", "green", "yellow", "gray", "grey", "pink",
+    "purple", "orange", "brown", "silver", "gold", "beige", "navy", "neutral",
+    "color", "colors", "colour", "colours", "colorway", "colorways", "multicolor",
+    "breathable", "lightweight", "comfortable", "comfy", "casual", "waterproof",
+    "durable", "premium", "quality", "soft", "warm", "cool", "versatile",
+    "simple", "classic", "stylish", "fashion", "fashionable", "new", "best",
+    "minimalist", "design", "designs", "style", "look", "everyday", "daily",
+    "size", "sizes", "women", "womens", "woman", "men", "mens", "man",
+    "unisex", "adult", "adults", "kids", "boys", "girls", "the", "for", "and",
+    "with", "your",
+}
+
+
+def _keyword_tokens(keywords: list[str]) -> set[str]:
+    """Split search-keyword phrases into specific product words (≥3 chars,
+    excluding generic color/adjective words)."""
+    out: set[str] = set()
+    for phrase in keywords or []:
+        for raw in str(phrase).lower().replace("-", " ").split():
+            token = "".join(ch for ch in raw if ch.isalnum())
+            if len(token) >= 3 and token not in _GENERIC_WORDS:
+                out.add(token)
+    return out
 
 
 def _important_tokens(text: str) -> list[str]:

@@ -7,12 +7,13 @@ import android.util.Log
 import kotlin.math.sqrt
 
 /**
- * Streams microphone PCM16 mono @ 16 kHz for Qwen Omni Realtime input_audio_buffer.append.
+ * Streams microphone PCM16 mono for Realtime input_audio_buffer.append.
  *
  * [onEnergy] reports PCM RMS per chunk so the UI can do local barge-in when server VAD
  * is deaf (common on emulators with speaker echo / weak host mic).
  */
 class AudioCapture(
+    private val sampleRate: Int = DEFAULT_SAMPLE_RATE,
     private val onPcmChunk: (ByteArray) -> Unit,
     private val onEnergy: ((Double) -> Unit)? = null
 ) {
@@ -23,7 +24,7 @@ class AudioCapture(
 
     fun start() {
         if (running) return
-        val rate = SAMPLE_RATE
+        val rate = sampleRate
         val minBuf = AudioRecord.getMinBufferSize(
             rate,
             AudioFormat.CHANNEL_IN_MONO,
@@ -86,7 +87,10 @@ class AudioCapture(
 
     companion object {
         private const val TAG = "AudioCapture"
-        const val SAMPLE_RATE = 16_000
+        const val DEFAULT_SAMPLE_RATE = 16_000
+        const val QWEN_SAMPLE_RATE = 16_000
+        const val OPENAI_SAMPLE_RATE = 24_000
+        const val SAMPLE_RATE = DEFAULT_SAMPLE_RATE
 
         fun rmsPcm16(pcm: ByteArray): Double {
             if (pcm.size < 2) return 0.0

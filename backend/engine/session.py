@@ -74,6 +74,12 @@ class SessionStore:
             if len(state.image_refs) > 20:
                 state.image_refs = state.image_refs[-20:]
 
+    def update_risk(self, session_id: str, category: str, reasons: list[str]) -> None:
+        with self._lock:
+            state = self.require(session_id)
+            state.risk_category = category
+            state.risk_reasons = reasons[-5:]
+
     def snapshot(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
             state = self.get(session_id)

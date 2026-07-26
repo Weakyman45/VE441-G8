@@ -1,34 +1,44 @@
-"""Build a compact on-device laptop catalog (laptops.db) from the
+"""Build a compact on-device product catalog (catalog.db) from the
 Amazon Reviews 2023 dataset (https://amazon-reviews-2023.github.io).
 
-Route A of the VoiceShop++ data plan: keep only laptop-like products from
-the *Electronics* item metadata, apply rule-based extraction (regex over
-`details` / `features`) to fill the fields the Android UI needs, and write
-a small SQLite file that the app loads from its assets folder.
+Route A of the VoiceShop++ data plan: keep real products from one or more
+category metadata files, apply best-effort rule-based extraction (regex over
+`details` / `features`) to fill the fields the UI can use, and write a small
+SQLite file the backend serves (and the app can bundle as an offline fallback).
 
-TWO WAYS TO GET THE INPUT DATA
-------------------------------
-1) OFFLINE (recommended when the machine running Python has no internet):
-   Download the metadata file on any machine that has internet:
+NOTE (previously laptop-only): this builder no longer filters to laptops. It
+keeps products from whatever `meta_*.jsonl(.gz)` files you feed it, so the app
+can search any product category present in your inputs. Laptop-specific fields
+(display / performance / battery / weight / platform) are filled when the item
+looks like a computer and left empty otherwise — the UI hides empty fields.
 
-     meta_Electronics.jsonl.gz  (~1.31 GB, 2023 version)
-     https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/raw/meta_categories/meta_Electronics.jsonl.gz
+GETTING THE INPUT DATA
+----------------------
+Amazon Reviews 2023 ships one metadata file PER CATEGORY. Download the ones you
+want (each is line-based JSONL, so a partial download of the first chunk works):
 
-   You do NOT need the whole file. Since it is line-based JSONL, you can
-   download only the first chunk (e.g. ~200 MB) and this script will read
-   what it can and stop after finding enough laptops:
+  https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/raw/meta_categories/meta_<Category>.jsonl.gz
 
-     curl.exe -r 0-209715200 -o meta_Electronics_part.jsonl.gz "<url above>"
+Examples of <Category>: Electronics, Cell_Phones_and_Accessories,
+Clothing_Shoes_and_Jewelry, Home_and_Kitchen, Sports_and_Outdoors,
+Toys_and_Games, Video_Games, Office_Products, Beauty_and_Personal_Care ...
+(full list: https://amazon-reviews-2023.github.io)
 
-   Then run:
-     python build_laptops.py --input meta_Electronics_part.jsonl.gz --limit 500 --out laptops.db
+Download only the first chunk of each (line-based JSONL tolerates truncation):
 
-2) ONLINE (needs internet + `pip install datasets`):
-     python build_laptops.py --limit 500 --out laptops.db
+  curl.exe -r 0-262144000 -o meta_Electronics_part.jsonl.gz "<url above>"
 
-No LLM / API key is used. Missing fields are left empty and the app hides
-them gracefully. `average_rating` / `rating_number` come from the metadata,
-so the huge review files are never needed.
+Then build a combined catalog from several files at once:
+
+  python build_laptops.py --input meta_Electronics_part.jsonl.gz meta_Cell_Phones_and_Accessories_part.jsonl.gz --limit 2000 --out ../backend/data/catalog.db
+
+ONLINE mode (needs internet + `pip install datasets`) streams whole categories:
+
+  python build_laptops.py --online-category Electronics --online-category Video_Games --limit 2000 --out catalog.db
+
+No LLM / API key is used. Missing fields are left empty and the app hides them
+gracefully. `average_rating` / `rating_number` come from the metadata, so the
+huge review files are never needed.
 """
 
 from __future__ import annotations
@@ -42,47 +52,36 @@ from typing import Any, Iterable
 
 
 DATASET = "McAuley-Lab/Amazon-Reviews-2023"
-META_CONFIG = "raw_meta_Electronics"  # laptops live inside Electronics
 
-LAPTOP_KEYWORDS = ("laptop", "notebook", "chromebook", "macbook", "ultrabook")
-# Accessory phrasing: a product that is FOR a laptop, not a laptop itself,
-# e.g. "Sun Shade for 15-16 Laptops", "lid for 15-Inch Inspiron Laptop".
-ACCESSORY_PHRASES = ("compatible with",)
-_FOR_LAPTOP_RE = re.compile(r"\bfor\b.{0,40}(laptop|notebook|macbook|chromebook)")
-# Words that usually mean "accessory / part", not an actual laptop.
-EXCLUDE_KEYWORDS = (
-    "case", "sleeve", "cover", "bag", "backpack", "charger", "adapter",
-    "cable", "cooling pad", "screen protector", "protector", "sticker",
-    "skin", "keyboard", "mouse", "replacement", "sodimm", "dimm", "ddr",
-    "ssd", "hard drive", "hdd", "docking", "usb hub", "cleaner",
-    "power strip", "power bank", "surge", "tablet", "drawing",
-    "earbud", "earphone", "headphone", "headset", "speaker", "webcam",
-    "microphone", "tripod", "stylus", "memory card", "flash drive",
-    "battery", "lcd", "digitizer", "decal",
-    " stand", "cooler", "cool pad", "cooling", "projector", "riser",
-    "mount", "holder", "lap desk", "pad-", "tray", "pillow",
-    "filter", "screwdriver", "portfolio", "briefcase", "tote", "messenger",
-    "lid", "hood", "shade", "privacy", "daypack", "rucksack", "grip",
+# Computer keywords are only used to decide whether the laptop-specific fields
+# (display / performance / battery / weight / platform) are worth extracting.
+_COMPUTER_KEYWORDS = (
+    "laptop", "notebook", "chromebook", "macbook", "ultrabook", "desktop",
+    "pc ", "computer",
 )
 
+# Obvious non-products / placeholder titles we skip regardless of category.
+_JUNK_TITLE_RE = re.compile(r"^\s*(unknown|n/?a|null|none)\s*$", re.IGNORECASE)
 
-def looks_like_laptop(item: dict[str, Any]) -> bool:
-    title = (item.get("title") or "").lower()
-    if not title:
+
+def looks_like_product(item: dict[str, Any]) -> bool:
+    """Very permissive filter: keep anything with a usable title and id.
+
+    We intentionally do NOT restrict by category here — the whole point is to
+    let users search any product present in the input files.
+    """
+    title = (item.get("title") or "").strip()
+    if not title or _JUNK_TITLE_RE.match(title):
         return False
-    # Reject accessories that merely mention a laptop.
-    if any(phrase in title for phrase in ACCESSORY_PHRASES):
+    pid = item.get("parent_asin") or item.get("asin")
+    if not pid:
         return False
-    if _FOR_LAPTOP_RE.search(title):
-        return False
-    # Require a laptop keyword in the TITLE (not just categories) for precision.
-    if not any(kw in title for kw in LAPTOP_KEYWORDS):
-        return False
-    if any(kw in title for kw in EXCLUDE_KEYWORDS):
-        return False
-    # NOTE: 2023 metadata often has price == "None". Do NOT require a price,
-    # otherwise most real laptops get dropped and you end up with 0 rows.
     return True
+
+
+def _looks_like_computer(title: str) -> bool:
+    low = title.lower()
+    return any(kw in low for kw in _COMPUTER_KEYWORDS)
 
 
 def _as_list(value: Any) -> list[str]:
@@ -185,6 +184,9 @@ def parse_weight_kg(details: dict[str, str]) -> float:
 
 
 def detect_platform(title: str, details: dict[str, str]) -> str:
+    """Only meaningful for computers; empty for other product categories."""
+    if not _looks_like_computer(title):
+        return ""
     text = f"{title} {_first_match(details, 'Operating System', 'OS')}".lower()
     if "macbook" in text or "mac os" in text or "macos" in text:
         return "macOS"
@@ -223,15 +225,17 @@ def to_row(item: dict[str, Any]) -> tuple:
     rating = float(item.get("average_rating") or 0.0)
     rating_number = int(item.get("rating_number") or 0)
     summary = (features[0] if features else (description[0] if description else "")).strip()[:120]
+    title = (item.get("title") or "").strip()
+    is_computer = _looks_like_computer(title)
     return (
         item.get("parent_asin") or item.get("asin") or "",
-        (item.get("title") or "").strip()[:90],
+        title[:90],
         _price_of(item),
         round(rating, 1),
         rating_number,
-        build_display(details),
-        build_performance(details),
-        build_battery(details, features),
+        build_display(details) if is_computer else "",
+        build_performance(details) if is_computer else "",
+        build_battery(details, features) if is_computer else "",
         parse_weight_kg(details),
         summary,
         review_sentiment(rating, rating_number),
@@ -240,7 +244,7 @@ def to_row(item: dict[str, Any]) -> tuple:
         "",  # trade_offs: no reliable rule-based source; UI hides when empty
         (item.get("store") or "").strip()[:60],
         _first_image(item),
-        detect_platform(item.get("title") or "", details),
+        detect_platform(title, details),
     )
 
 
@@ -266,6 +270,8 @@ def _first_image(item: dict[str, Any]) -> str:
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
+    # Table kept named `laptops` for backward compatibility with the backend
+    # (server.py) and the Android offline reader. It now holds any product.
     conn.execute("DROP TABLE IF EXISTS laptops")
     conn.execute(
         """
@@ -317,7 +323,7 @@ def iter_local(path: str, limit: int) -> Iterable[dict[str, Any]]:
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue  # partial/truncated final line
-            if not looks_like_laptop(item):
+            if not looks_like_product(item):
                 continue
             yield item
             kept += 1
@@ -329,20 +335,21 @@ def iter_local(path: str, limit: int) -> Iterable[dict[str, Any]]:
         fp.close()
 
 
-def iter_online(limit: int) -> Iterable[dict[str, Any]]:
-    """Fallback: stream from HuggingFace (requires internet + datasets)."""
+def iter_online(category: str, limit: int) -> Iterable[dict[str, Any]]:
+    """Fallback: stream one category from HuggingFace (needs internet + datasets)."""
     try:
         from datasets import load_dataset
     except ImportError as exc:
         raise SystemExit(
             "Online mode needs the 'datasets' package. Either run:\n"
             "  pip install datasets\n"
-            "or use offline mode with --input <meta_Electronics.jsonl.gz>."
+            "or use offline mode with --input <meta_*.jsonl.gz>."
         ) from exc
-    stream = load_dataset(DATASET, META_CONFIG, split="full", streaming=True)
+    config = f"raw_meta_{category}"
+    stream = load_dataset(DATASET, config, split="full", streaming=True)
     kept = 0
     for item in stream:
-        if not looks_like_laptop(item):
+        if not looks_like_product(item):
             continue
         yield item
         kept += 1
@@ -351,46 +358,84 @@ def iter_online(limit: int) -> Iterable[dict[str, Any]]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build laptops.db for VoiceShop++")
-    parser.add_argument("--limit", type=int, default=500, help="max laptops to keep")
+    parser = argparse.ArgumentParser(description="Build a product catalog.db for VoiceShop++")
+    parser.add_argument("--limit", type=int, default=2000, help="max total products to keep across all inputs")
+    parser.add_argument(
+        "--per-input-limit",
+        type=int,
+        default=None,
+        help="cap products taken from EACH input file/category (keeps categories balanced).",
+    )
     parser.add_argument(
         "--input",
+        nargs="+",
         default=None,
-        help="local meta_*.jsonl(.gz) file. If omitted, streams online via datasets.",
+        help="one or more local meta_*.jsonl(.gz) files (any categories).",
     )
-    parser.add_argument("--out", default="laptops.db", help="output SQLite path")
+    parser.add_argument(
+        "--online-category",
+        action="append",
+        default=None,
+        metavar="CATEGORY",
+        help="stream this category online (repeatable). Needs `pip install datasets`.",
+    )
+    parser.add_argument("--out", default="catalog.db", help="output SQLite path")
     args = parser.parse_args()
 
-    source = iter_local(args.input, args.limit) if args.input else iter_online(args.limit)
-    if args.input:
-        print(f"Reading laptops from local file: {args.input}")
-    else:
-        print("Streaming laptops online from HuggingFace ...")
+    if not args.input and not args.online_category:
+        parser.error("provide --input <files...> (offline) or --online-category <name> (online)")
 
     conn = sqlite3.connect(args.out)
     try:
         create_schema(conn)
         inserted = 0
         seen: set[str] = set()
-        for item in source:
-            row = to_row(item)
-            pid = row[0]
-            if not pid or pid in seen:
-                continue
-            seen.add(pid)
-            conn.execute(
-                "INSERT OR REPLACE INTO laptops VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                row,
-            )
-            inserted += 1
-            if inserted % 50 == 0:
-                print(f"  ... {inserted} laptops")
+
+        def consume(source: Iterable[dict[str, Any]], label: str) -> None:
+            nonlocal inserted
+            before = inserted
+            for item in source:
+                if inserted >= args.limit:
+                    break
+                row = to_row(item)
+                pid = row[0]
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                conn.execute(
+                    "INSERT OR REPLACE INTO laptops VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    row,
+                )
+                inserted += 1
+                if inserted % 100 == 0:
+                    print(f"  ... {inserted} products")
+            print(f"  [{label}] added {inserted - before} products")
+
+        def source_cap() -> int:
+            remaining = args.limit - inserted
+            if args.per_input_limit:
+                return min(remaining, args.per_input_limit)
+            return remaining
+
+        if args.input:
+            for path in args.input:
+                if inserted >= args.limit:
+                    break
+                print(f"Reading products from local file: {path}")
+                consume(iter_local(path, source_cap()), path)
+        if args.online_category and inserted < args.limit:
+            for category in args.online_category:
+                if inserted >= args.limit:
+                    break
+                print(f"Streaming category online: {category}")
+                consume(iter_online(category, source_cap()), category)
+
         conn.commit()
-        print(f"Done. Wrote {inserted} laptops to {args.out}")
+        print(f"Done. Wrote {inserted} products to {args.out}")
         if inserted == 0:
             print(
-                "WARNING: 0 laptops found. If you used a partial download, grab a\n"
-                "bigger chunk (laptops may not appear in the very first rows)."
+                "WARNING: 0 products found. If you used a partial download, grab a\n"
+                "bigger chunk, or check the input file path / category name."
             )
     finally:
         conn.close()

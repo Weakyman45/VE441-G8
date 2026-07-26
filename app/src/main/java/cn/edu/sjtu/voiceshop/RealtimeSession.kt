@@ -27,6 +27,7 @@ class RealtimeSession(
     interface Listener {
         fun onConnectionChanged(connected: Boolean)
         fun onSessionReady(sessionId: String)
+        fun onTalkerReady(provider: String, inputAudioSampleRate: Int)
         fun onUserSpeechStarted()
         fun onUserSpeechStopped()
         fun onUserTranscript(text: String, isFinal: Boolean)
@@ -47,22 +48,33 @@ class RealtimeSession(
     private var webSocket: WebSocket? = null
     private val open = AtomicBoolean(false)
     private val assistantBuffer = StringBuilder()
+    private val truncatedAssistantItemIds = mutableSetOf<String>()
     @Volatile private var currentResponseItemId: String? = null
     @Volatile private var responseInProgress = false
+    @Volatile private var ignoreNextAssistantDone = false
     @Volatile var sessionId: String? = null
         private set
-    @Volatile private var talkerWsPath: String = "/api/v1/qwen/realtime/ws"
+    @Volatile var talkerProvider: String = "qwen"
+        private set
+    @Volatile var inputAudioSampleRate: Int = AudioCapture.QWEN_SAMPLE_RATE
+        private set
+    @Volatile private var talkerWsPath: String = "/api/v1/realtime/ws"
+    @Volatile private var interruptionHandlingEnabled = true
 
     fun connect() {
         Thread({
             try {
                 listener.onStatus("Creating shopping session…")
                 val created = createBackendSession()
-                sessionId = created.first
-                talkerWsPath = created.second
-                listener.onSessionReady(created.first)
-                listener.onStatus("Connecting Qwen Omni Talker…")
-                openWebSocketViaBackend(created.first, created.second)
+                sessionId = created.sessionId
+                talkerWsPath = created.wsPath
+                talkerProvider = created.provider
+                inputAudioSampleRate = created.inputAudioSampleRate
+                interruptionHandlingEnabled = created.interruptionHandlingEnabled
+                listener.onSessionReady(created.sessionId)
+                listener.onTalkerReady(created.provider, created.inputAudioSampleRate)
+                listener.onStatus("Connecting ${created.providerLabel} Talker…")
+                openWebSocketViaBackend(created.sessionId, created.wsPath)
             } catch (error: Exception) {
                 Log.e(TAG, "Connect failed via $backendBaseUrl", error)
                 listener.onError("Connect failed ($backendBaseUrl): ${error.message}")
@@ -71,8 +83,18 @@ class RealtimeSession(
         }, "realtime-connect").start()
     }
 
-    /** @return Pair(sessionId, wsPath) */
-    private fun createBackendSession(): Pair<String, String> {
+    private data class BackendSession(
+        val sessionId: String,
+        val wsPath: String,
+        val provider: String,
+        val inputAudioSampleRate: Int,
+        val interruptionHandlingEnabled: Boolean
+    ) {
+        val providerLabel: String
+            get() = if (provider == "openai") "GPT Realtime" else "Qwen Omni"
+    }
+
+    private fun createBackendSession(): BackendSession {
         val url = URL("$backendBaseUrl/api/v1/session")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
@@ -101,9 +123,17 @@ class RealtimeSession(
             val path = when {
                 wsUrl.contains("?") -> wsUrl.substringBefore("?")
                 wsUrl.isNotBlank() -> wsUrl
-                else -> "/api/v1/qwen/realtime/ws"
+                else -> "/api/v1/realtime/ws"
             }
-            return sid to path
+            val provider = obj.optString("talker").ifBlank {
+                if (path.contains("/openai/")) "openai" else "qwen"
+            }
+            val sampleRate = obj.optInt(
+                "input_audio_sample_rate",
+                if (provider == "openai") AudioCapture.OPENAI_SAMPLE_RATE else AudioCapture.QWEN_SAMPLE_RATE
+            )
+            val interruptionHandling = obj.optBoolean("interruption_handling_enabled", true)
+            return BackendSession(sid, path, provider, sampleRate, interruptionHandling)
         } finally {
             conn.disconnect()
         }
@@ -145,7 +175,7 @@ class RealtimeSession(
         })
     }
 
-    /** Append a PCM16 mono 24 kHz chunk (Base64 over the wire). */
+    /** Append a PCM16 mono chunk (Base64 over the wire). */
     fun appendAudioPcm16(pcm: ByteArray) {
         if (!isConnected() || pcm.isEmpty()) return
         val b64 = Base64.encodeToString(pcm, Base64.NO_WRAP)
@@ -162,6 +192,7 @@ class RealtimeSession(
     fun interruptAssistant(playedMs: Int) {
         if (!isConnected()) return
         val itemId = currentResponseItemId
+        val heardText = assistantBuffer.toString().trim()
         if (responseInProgress) {
             sendJson(JSONObject().apply { put("type", "response.cancel") })
         }
@@ -172,6 +203,11 @@ class RealtimeSession(
                 put("content_index", 0)
                 put("audio_end_ms", playedMs)
             })
+            truncatedAssistantItemIds.add(itemId)
+            ignoreNextAssistantDone = true
+        }
+        if (interruptionHandlingEnabled && heardText.isNotBlank()) {
+            listener.onAssistantTextDone("$heardText $INTERRUPTED_MARKER")
         }
         responseInProgress = false
         currentResponseItemId = null
@@ -179,7 +215,7 @@ class RealtimeSession(
     }
 
     private fun openWebSocketViaBackend(sessionId: String, wsPath: String) {
-        val path = wsPath.trim().ifBlank { "/api/v1/qwen/realtime/ws" }
+        val path = wsPath.trim().ifBlank { "/api/v1/realtime/ws" }
         val wsUrl = backendBaseUrl
             .replace("https://", "wss://")
             .replace("http://", "ws://")
@@ -191,7 +227,8 @@ class RealtimeSession(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 open.set(true)
                 listener.onConnectionChanged(true)
-                listener.onStatus("Qwen Omni connected (full-duplex)")
+                val label = if (talkerProvider == "openai") "GPT Realtime" else "Qwen Omni"
+                listener.onStatus("$label connected (full-duplex)")
                 // Backend seeds the Qwen session.update. Do not send a second
                 // Android-side update: Qwen rejects some OpenAI-style fields.
             }
@@ -231,7 +268,7 @@ class RealtimeSession(
             put("session", JSONObject().apply {
                 put("modalities", JSONArray().put("text").put("audio"))
                 put("voice", "Tina")
-                put("instructions", SHOPPING_INSTRUCTIONS)
+                put("instructions", shoppingInstructions())
                 put("input_audio_format", "pcm")
                 put("output_audio_format", "pcm")
                 put("input_audio_transcription", JSONObject().apply {
@@ -310,12 +347,16 @@ class RealtimeSession(
             }
 
             "response.output_text.done", "response.text.done" -> {
+                val itemId = event.optString("item_id").takeIf { it.isNotBlank() }
+                if (shouldIgnoreAssistantDone(itemId)) return
                 val full = event.optString("text").ifBlank { assistantBuffer.toString() }
                 if (full.isNotBlank()) listener.onAssistantTextDone(full)
                 assistantBuffer.clear()
             }
 
             "response.output_audio_transcript.done", "response.audio_transcript.done" -> {
+                val itemId = event.optString("item_id").takeIf { it.isNotBlank() }
+                if (shouldIgnoreAssistantDone(itemId)) return
                 val full = event.optString("transcript")
                     .ifBlank { event.optString("text") }
                     .ifBlank { assistantBuffer.toString() }
@@ -324,6 +365,10 @@ class RealtimeSession(
             }
 
             "response.done", "response.cancelled" -> {
+                if (shouldIgnoreAssistantDone(null)) {
+                    responseInProgress = false
+                    return
+                }
                 if (assistantBuffer.isNotEmpty()) {
                     listener.onAssistantTextDone(assistantBuffer.toString())
                     assistantBuffer.clear()
@@ -346,8 +391,31 @@ class RealtimeSession(
         }
     }
 
+    private fun shouldIgnoreAssistantDone(itemId: String?): Boolean {
+        if (itemId != null && truncatedAssistantItemIds.remove(itemId)) {
+            assistantBuffer.clear()
+            ignoreNextAssistantDone = false
+            return true
+        }
+        if (ignoreNextAssistantDone) {
+            assistantBuffer.clear()
+            ignoreNextAssistantDone = false
+            return true
+        }
+        return false
+    }
+
+    private fun shoppingInstructions(): String {
+        return if (interruptionHandlingEnabled) {
+            "$SHOPPING_INSTRUCTIONS\n\n$INTERRUPTION_INSTRUCTIONS"
+        } else {
+            SHOPPING_INSTRUCTIONS
+        }
+    }
+
     companion object {
         private const val TAG = "RealtimeSession"
+        private const val INTERRUPTED_MARKER = "[INTERRUPTED]"
         private const val SHOPPING_INSTRUCTIONS =
             "You are VoiceShop++, a helpful retail shopping assistant. " +
                 "Always reply in English only — never switch to Chinese or other languages. " +
@@ -355,5 +423,28 @@ class RealtimeSession(
                 "brand preferences, and constraints. " +
                 "Ask concise clarifying questions when critical fields are missing. " +
                 "Keep spoken replies short so the user can interrupt naturally."
+        private const val INTERRUPTION_INSTRUCTIONS =
+            "If a prior assistant message contains [INTERRUPTED], that marks where the " +
+                "user cut you off; the user did not hear anything after that marker. " +
+                "## Handling interruptions (barge-in)\n\n" +
+                "The user can and will interrupt you mid-sentence. When that happens:\n\n" +
+                "1. You did NOT finish speaking. The user only heard the words up to the " +
+                "point where they cut in — never assume the rest was heard. Never claim " +
+                "or imply you \"already mentioned\" or \"just said\" something that came " +
+                "after the cut-off point.\n\n" +
+                "2. Whatever the user says when interrupting is their most current and " +
+                "highest-priority intent. Adopt it immediately and let it override your " +
+                "previous plan or the answer you were in the middle of giving.\n\n" +
+                "3. Be brief. Respond directly to what they now want. Do NOT re-read, " +
+                "recap, or repeat the recommendations or details they already heard " +
+                "before interrupting.\n\n" +
+                "4. Only restate something from the unspoken part if it is essential to the " +
+                "user's new request AND they were cut off before hearing it — and then " +
+                "keep it to a single short clause, not a re-listing.\n\n" +
+                "5. If the interruption is just a backchannel (\"uh-huh\", \"okay\", \"right\", " +
+                "\"mm-hmm\", \"got it\") or clearly not addressed to you (background speech, " +
+                "someone else talking), do NOT treat it as a new instruction. Continue " +
+                "naturally from where you were.\n\n" +
+                "Keep every reply short and spoken-style — one or two sentences."
     }
 }
