@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..conflicts import (
+    ConflictPacket,
+    build_talker_brief,
+    build_tradeoffs,
+)
 from ..llm.qwen_client import chat_completion, qwen_configured
 from ..models import PreferenceProfile, RankedProduct, RecommendationBundle
+from ..query_fusion import normalize_fuse_weights
 
 
 def rank_products(
@@ -11,28 +17,54 @@ def rank_products(
     profile: PreferenceProfile,
     candidates: list[dict[str, Any]],
     top_n: int = 40,
+    *,
+    fuse_weights: dict[str, float] | None = None,
+    modality: str = "text",
+    conflicts: list[ConflictPacket] | list[dict[str, Any]] | None = None,
+    unresolved: list[ConflictPacket] | list[dict[str, Any]] | None = None,
 ) -> RecommendationBundle:
+    weights = normalize_fuse_weights(fuse_weights, modality=modality)
     query_tokens = _keyword_tokens(profile.search_keywords)
-    scored: list[tuple[int, int, dict[str, Any], list[str]]] = []
+    scored: list[tuple[float, int, dict[str, Any], list[str]]] = []
     excluded: list[dict[str, str]] = []
+    soft_conflicts: list[ConflictPacket] = []
+
     for item in candidates:
-        score, reasons, exclude_reason = _score(profile, item)
+        score, reasons, exclude_reason = _score(profile, item, weights)
         if exclude_reason:
             excluded.append({"id": str(item.get("id", "")), "reason": exclude_reason})
             continue
-        # Relevance = how many specific product words appear in the name. This is
-        # the PRIMARY ranking signal: a genuine match must outrank a merely
-        # high-rated item, otherwise ratings saturate the score cap and cheap
-        # irrelevant products win the tiebreak.
         name = str(item.get("name") or "").lower()
-        relevance = sum(1 for t in query_tokens if t in name)
-        scored.append((relevance, score, item, reasons))
-    # Sort by relevance first, then quality score, then price ascending.
+        text_hits = sum(1 for t in query_tokens if t in name)
+        # Primary sort key blends keyword relevance with fused text/visual score.
+        fused_rank = (
+            weights["text"] * float(text_hits)
+            + weights["visual"] * float(item.get("_visual_score") or 0.0) * 5.0
+        )
+        scored.append((fused_rank, score, item, reasons))
+
+        # Soft trade-off: expensive but strong visual match.
+        price = int(item.get("price") or 0)
+        cmp_b = _cmp_budget(profile.budget)
+        vis = float(item.get("_visual_score") or 0.0)
+        if cmp_b and price > cmp_b and vis >= 0.55:
+            soft_conflicts.append(
+                ConflictPacket(
+                    product_id=str(item.get("id") or ""),
+                    product_name=str(item.get("name") or ""),
+                    conflict_type="soft_tradeoff",
+                    constraint=f"strong visual match but above budget ({price} > ~{cmp_b})",
+                    status="soft_tradeoff",
+                    evidence=[
+                        {"source": "visual", "snippet": f"similarity={vis:.2f}", "confidence": vis},
+                        {"source": "price", "snippet": str(price), "confidence": 0.9},
+                    ],
+                    user_action="accept_tradeoff",
+                )
+            )
+
     scored.sort(key=lambda x: (-x[0], -x[1], x[2].get("price") or 10**9))
-    # Show ALL genuinely relevant products (name matched >=1 specific product
-    # word), not just a fixed top-3. Only when nothing matched the keywords do
-    # we fall back to a small set so the screen is not empty.
-    relevant = [t for t in scored if t[0] >= 1]
+    relevant = [t for t in scored if t[0] > 0 or t[1] >= 70]
     selected = (relevant if relevant else scored[:6])[:top_n]
     ranked = [
         RankedProduct(
@@ -49,18 +81,56 @@ def rank_products(
             weight_kg=float(item.get("weight_kg") or 0),
             image_url=str(item.get("image_url") or ""),
         )
-        for relevance, score, item, reasons in selected
+        for fused_rank, score, item, reasons in selected
     ]
     summary = _summary(profile, ranked)
     if ranked and qwen_configured():
         summary = _qwen_summary(profile, ranked, summary)
+
+    packets = _as_packets(conflicts) + _as_packets(unresolved) + soft_conflicts[:3]
+    tradeoffs = build_tradeoffs(ranked)
+    open_questions = [
+        f"I could not verify '{c.constraint}' for {c.product_name or 'a candidate'}. "
+        "Should that stay a hard requirement?"
+        for c in _as_packets(unresolved)[:2]
+    ]
+    talker_brief = build_talker_brief(
+        summary=summary,
+        ranked=ranked,
+        conflicts=packets,
+        tradeoffs=tradeoffs,
+        open_questions=open_questions,
+    )
+
     return RecommendationBundle(
         plan_id=plan_id,
         ranked=ranked,
         excluded=excluded[:8],
         summary=summary,
         status="ready",
+        conflicts=[c.to_dict() for c in packets[:12]],
+        tradeoffs=tradeoffs,
+        open_questions=open_questions,
+        talker_brief=talker_brief,
     )
+
+
+def _as_packets(
+    items: list[ConflictPacket] | list[dict[str, Any]] | None,
+) -> list[ConflictPacket]:
+    out: list[ConflictPacket] = []
+    for item in items or []:
+        if isinstance(item, ConflictPacket):
+            out.append(item)
+        elif isinstance(item, dict):
+            out.append(ConflictPacket.from_dict(item))
+    return out
+
+
+def _cmp_budget(budget: int | None) -> int | None:
+    if not budget:
+        return None
+    return budget if budget < 3000 else max(800, int(budget / 7))
 
 
 def _qwen_summary(
@@ -105,7 +175,11 @@ def _qwen_summary(
         return fallback
 
 
-def _score(profile: PreferenceProfile, item: dict[str, Any]) -> tuple[int, list[str], str | None]:
+def _score(
+    profile: PreferenceProfile,
+    item: dict[str, Any],
+    weights: dict[str, float],
+) -> tuple[int, list[str], str | None]:
     reasons: list[str] = []
     price = int(item.get("price") or 0)
     rating = float(item.get("rating") or 0)
@@ -115,7 +189,6 @@ def _score(profile: PreferenceProfile, item: dict[str, Any]) -> tuple[int, list[
     score = int(max(60, min(99, rating / 5.0 * 100))) if rating else 70
 
     if profile.budget and price > 0:
-        # Compare in catalog currency loosely
         budget = profile.budget
         cmp_budget = budget if budget < 3000 else max(800, int(budget / 7))
         if price <= cmp_budget:
@@ -134,18 +207,26 @@ def _score(profile: PreferenceProfile, item: dict[str, Any]) -> tuple[int, list[
         profile.soft + profile.hard + [profile.use_case, profile.raw_query, profile.visual_context]
     ).lower()
     haystack = " ".join(
-        str(item.get(k) or "") for k in ("name", "summary", "display", "performance", "platform")
+        str(item.get(k) or "") for k in ("name", "summary", "display", "performance", "platform", "enriched_text")
     ).lower()
-    # Reward products whose NAME contains the specific product WORDS from the
-    # search keywords. Match individual tokens (not whole phrases) and drop
-    # generic color/adjective words, so a real "running shoe" outranks a
-    # "neutral color" hair clip. Weighted heavily so relevance beats raw rating.
     name = str(item.get("name") or "").lower()
     query_tokens = _keyword_tokens(profile.search_keywords)
     matched = sorted({t for t in query_tokens if t in name})
+    text_bonus = 0
     if matched:
-        score += min(30, 8 * len(matched))
+        text_bonus = min(30, 8 * len(matched))
         reasons.append("Matches: " + ", ".join(matched)[:60])
+
+    visual = float(item.get("_visual_score") or 0.0)
+    visual_bonus = 0
+    if visual > 0:
+        visual_bonus = int(round(visual * 20))
+        if visual >= 0.45:
+            reasons.append(f"Visual similarity {visual:.2f}")
+
+    # Blend text/visual contribution into the heuristic score using fuse weights.
+    score += int(round(weights["text"] * text_bonus + weights["visual"] * visual_bonus))
+
     for token in _important_tokens(profile.visual_context):
         if token in haystack:
             score += 3
@@ -170,8 +251,6 @@ def _score(profile: PreferenceProfile, item: dict[str, Any]) -> tuple[int, list[
     return max(60, min(99, score)), reasons, None
 
 
-# Generic color / adjective words that match almost anything in an English
-# catalog and therefore must NOT count as relevance signal on their own.
 _GENERIC_WORDS = {
     "white", "black", "red", "blue", "green", "yellow", "gray", "grey", "pink",
     "purple", "orange", "brown", "silver", "gold", "beige", "navy", "neutral",
@@ -187,8 +266,6 @@ _GENERIC_WORDS = {
 
 
 def _keyword_tokens(keywords: list[str]) -> set[str]:
-    """Split search-keyword phrases into specific product words (≥3 chars,
-    excluding generic color/adjective words)."""
     out: set[str] = set()
     for phrase in keywords or []:
         for raw in str(phrase).lower().replace("-", " ").split():

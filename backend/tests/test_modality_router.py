@@ -10,9 +10,22 @@ from engine.models import SessionState, PreferenceProfile  # noqa: E402
 
 
 def cfg(**kw):
-    base = dict(modality_routing=True, visual_recall=True, enrichment=True,
-                source_layering=True, verifier="llm", reviews=True, visual_top_k=40,
-                review_top_k=20, embedding_provider="hash")
+    base = dict(
+        modality_routing=True,
+        visual_recall=True,
+        enrichment=True,
+        source_layering=True,
+        verifier="llm",
+        reviews=True,
+        intent_shortcircuit=True,
+        planner_replan=True,
+        planner_llm=True,
+        memory=True,
+        max_replans=2,
+        visual_top_k=40,
+        review_top_k=20,
+        embedding_provider="hash",
+    )
     base.update(kw)
     return ExpConfig(**base)
 
@@ -68,7 +81,8 @@ class TestRoute(unittest.TestCase):
     def test_image_route(self):
         p = mr.route(session(text="[image uploaded]", image=True), cfg())
         self.assertEqual(p.modality, mr.MODALITY_IMAGE)
-        self.assertFalse(p.do_text_recall)
+        # A_I fills keywords, then text ∥ visual recall.
+        self.assertTrue(p.do_text_recall)
         self.assertTrue(p.do_visual_recall)
         self.assertTrue(p.infer_category_from_image)
         self.assertTrue(p.reverse_verify)

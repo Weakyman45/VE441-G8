@@ -98,7 +98,24 @@ class TestExpConfig(unittest.TestCase):
         s = exp_config.load_config().summary()
         self.assertEqual(set(s), {"modality_routing", "visual_recall", "enrichment",
                                   "source_layering", "verifier", "reviews",
+                                  "intent_shortcircuit", "planner_replan", "planner_llm",
+                                  "memory", "max_replans",
                                   "visual_top_k", "review_top_k", "embedding_provider"})
+
+    def test_planner_flags_default_on(self):
+        c = exp_config.load_config()
+        self.assertTrue(c.intent_shortcircuit)
+        self.assertTrue(c.planner_replan)
+        self.assertTrue(c.planner_llm)
+        self.assertTrue(c.memory)
+        self.assertEqual(c.max_replans, 2)
+        os.environ["VS_MEMORY"] = "0"
+        os.environ["VS_PLANNER_LLM"] = "0"
+        os.environ["VS_MAX_REPLANS"] = "9"
+        c2 = exp_config.load_config()
+        self.assertFalse(c2.memory)
+        self.assertFalse(c2.planner_llm)
+        self.assertEqual(c2.max_replans, 5)  # clamped
 
 
 if __name__ == "__main__":

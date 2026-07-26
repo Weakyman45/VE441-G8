@@ -122,13 +122,13 @@ def route(session, config: ExpConfig | None = None) -> RoutePlan:
             reason="text+image: (text ∥ visual) recall -> merge -> verify -> rank",
         )
 
-    # MODALITY_IMAGE(纯图片)
+    # MODALITY_IMAGE(纯图片): A_I 先抽品类/关键词,再走文本+视觉召回
     return RoutePlan(
         modality=modality,
-        do_text_recall=False,
+        do_text_recall=True,
         do_visual_recall=visual_ok,
         infer_category_from_image=True,
         reverse_verify=True,
         do_verify=cfg.verifier_enabled,
-        reason="image-only: VL categorize -> in-category visual recall -> reverse verify -> rank",
+        reason="image-only: A_I -> (text ∥ visual) recall -> reverse verify -> rank",
     )
