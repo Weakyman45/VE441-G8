@@ -60,7 +60,7 @@ def _tokens(text: str) -> set[str]:
     return out
 
 
-def _item_haystack(item: dict) -> str:
+def _item_haystack(item: dict, use_reviews: bool = True) -> str:
     parts = [str(item.get(k) or "") for k in
              ("name", "summary", "enriched_text", "display", "performance", "platform")]
     reasons = item.get("reasons")
@@ -71,18 +71,21 @@ def _item_haystack(item: dict) -> str:
     va = item.get("visual_attrs")
     if isinstance(va, str) and va:
         parts.append(va)
-    # 评论关键词 / pros / 摘要:让"只在评论里出现的软需求"(安静/透气/正码…)可被命中
-    ra = item.get("review_aspects")
-    if isinstance(ra, str) and ra:
-        try:
-            d = json.loads(ra)
-            if isinstance(d, dict):
-                parts.append(" ".join(str(x) for x in (d.get("keywords") or [])))
-                parts.append(" ".join(str(x) for x in (d.get("pros") or [])))
-                if d.get("summary"):
-                    parts.append(str(d.get("summary")))
-        except (json.JSONDecodeError, TypeError):
-            pass
+    # 评论关键词 / pros / 摘要:让"只在评论里出现的软需求"(安静/透气/正码…)可被命中。
+    # 消融开关 VS_REVIEWS=0 时,即使库里已有 review_aspects 也不参与校验命中,
+    # 从而在同一个库上模拟"无 Reviewer"系统,便于做 A/B 消融实验。
+    if use_reviews:
+        ra = item.get("review_aspects")
+        if isinstance(ra, str) and ra:
+            try:
+                d = json.loads(ra)
+                if isinstance(d, dict):
+                    parts.append(" ".join(str(x) for x in (d.get("keywords") or [])))
+                    parts.append(" ".join(str(x) for x in (d.get("pros") or [])))
+                    if d.get("summary"):
+                        parts.append(str(d.get("summary")))
+            except (json.JSONDecodeError, TypeError):
+                pass
     return " ".join(parts).lower()
 
 
@@ -141,8 +144,33 @@ def _rule_musthave_ok(profile, hay_tokens: set[str], hay: str) -> tuple[bool, st
 # --------------------------------------------------------------------------- #
 # LLM-as-Judge 批量判定
 # --------------------------------------------------------------------------- #
-def _llm_judge_batch(profile, items: list[dict], unknown_tolerant: bool) -> dict[str, dict]:
-    """返回 id -> {keep: bool, reason: str}。失败返回空 dict(调用方回退规则)。"""
+def _review_snippet(item: dict) -> str:
+    """把商品评论方面(keywords/pros/summary)压成一小段文本,供 LLM 判官核对
+    只在评论里出现的体验类 must-have(安静/透气/正码…)。"""
+    ra = item.get("review_aspects")
+    if not isinstance(ra, str) or not ra:
+        return ""
+    try:
+        d = json.loads(ra)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(d, dict):
+        return ""
+    bits: list[str] = []
+    kw = d.get("keywords") or []
+    if kw:
+        bits.append("buyers say: " + ", ".join(str(x) for x in kw[:10]))
+    pros = d.get("pros") or []
+    if pros:
+        bits.append("pros: " + ", ".join(str(x) for x in pros[:6]))
+    return " | ".join(bits)[:200]
+
+
+def _llm_judge_batch(profile, items: list[dict], unknown_tolerant: bool,
+                     use_reviews: bool = True) -> dict[str, dict]:
+    """返回 id -> {keep: bool, reason: str}。失败返回空 dict(调用方回退规则)。
+    use_reviews=True 时把评论方面(review_aspects)一并喂给判官,使"只在评论里
+    出现的体验类 must-have"可被校验(消融开关 VS_REVIEWS 控制)。"""
     if not qwen_configured() or not items:
         return {}
     cat = (getattr(profile, "category", "") or "").strip()
@@ -150,11 +178,16 @@ def _llm_judge_batch(profile, items: list[dict], unknown_tolerant: bool) -> dict
              if not str(x).lower().startswith("budget")]
     cand_payload = []
     for it in items:
-        cand_payload.append({
+        entry = {
             "id": str(it.get("id") or ""),
             "name": str(it.get("name") or "")[:120],
             "info": (str(it.get("enriched_text") or "") or str(it.get("summary") or ""))[:220],
-        })
+        }
+        if use_reviews:
+            rv = _review_snippet(it)
+            if rv:
+                entry["reviews"] = rv
+        cand_payload.append(entry)
     policy = ("If an attribute cannot be determined from the product info, mark it "
               "\"unknown\" and DO NOT reject on that ground." if unknown_tolerant
               else "If an attribute cannot be determined, treat it as NOT satisfied.")
@@ -162,7 +195,10 @@ def _llm_judge_batch(profile, items: list[dict], unknown_tolerant: bool) -> dict
         "You are the Verifier/Reject agent of a shopping search system. For EACH "
         "candidate product decide whether it should be KEPT for recommendation, based "
         "on two hard constraints: (1) same product category as the user wants; "
-        "(2) all user must-haves are satisfied. " + policy + " "
+        "(2) all user must-haves are satisfied. A candidate may include a "
+        "\"reviews\" field summarizing what real buyers say; use it to judge "
+        "experiential must-haves (e.g. quiet, breathable, true-to-size) not stated "
+        "in the product info. " + policy + " "
         "Return ONLY a JSON object: {\"results\":[{\"id\":\"..\",\"category_match\":"
         "\"yes|no|unknown\",\"must_haves_met\":\"yes|no|unknown\",\"keep\":true|false,"
         "\"reason\":\"short\"}]}"
@@ -224,7 +260,8 @@ def verify_candidates(profile, candidates: list[dict],
     if cfg.verifier_uses_llm:
         head = survivors[:_MAX_LLM_CANDIDATES]
         tail = survivors[_MAX_LLM_CANDIDATES:]
-        verdicts = _llm_judge_batch(profile, head, cfg.verifier_unknown_tolerant)
+        verdicts = _llm_judge_batch(profile, head, cfg.verifier_unknown_tolerant,
+                                    use_reviews=cfg.reviews)
         method = "llm" if verdicts else "rule(llm_fallback)"
         for it in head:
             rid = str(it.get("id") or "")
@@ -251,7 +288,7 @@ def verify_candidates(profile, candidates: list[dict],
 
 def _rule_decide(profile, item: dict, kept: list[dict], rejected: list[dict],
                  cfg: ExpConfig) -> None:
-    hay = _item_haystack(item)
+    hay = _item_haystack(item, use_reviews=cfg.reviews)
     hay_tokens = _tokens(hay)
     ok_cat, r1 = _rule_category_ok(profile, hay_tokens)
     if not ok_cat:

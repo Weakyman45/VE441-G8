@@ -1,0 +1,81 @@
+{
+  "attribute": "durable",
+  "samples": [
+    {
+      "id": "B000B658RI",
+      "name": "Eye Patch Black Adult with Tie Band (6 Per Pack)",
+      "review_keywords": [
+        "comfortable",
+        "adjustable",
+        "well-covering",
+        "durable",
+        "large",
+        "unpadded",
+        "soft",
+        "reliable"
+      ],
+      "kept_when_reviews_ON": true,
+      "kept_when_reviews_OFF": true
+    },
+    {
+      "id": "B088FKY3VD",
+      "name": "Tattoo Eyebrow Stickers, Waterproof Eyebrow, 4D Imitation Eyebrow Tatt",
+      "review_keywords": [
+        "natural",
+        "realistic",
+        "waterproof",
+        "shiny",
+        "black",
+        "large",
+        "sticky",
+        "durable"
+      ],
+      "kept_when_reviews_ON": true,
+      "kept_when_reviews_OFF": true
+    },
+    {
+      "id": "B07GGYR3LJ",
+      "name": "Stainless Steel Beard Comb, Portable Fashionable Engraving Design Must",
+      "review_keywords": [
+        "stylish",
+        "durable",
+        "smooth",
+        "compact",
+        "well-made",
+        "amazing"
+      ],
+      "kept_when_reviews_ON": true,
+      "kept_when_reviews_OFF": true
+    },
+    {
+      "id": "B00FCQHYEW",
+      "name": "Small MONEY CLIP Leather Wallet ID Bag Cash Holder Credit Card Cover C",
+      "review_keywords": [
+        "slim",
+        "durable",
+        "stylish",
+        "lightweight",
+        "secure",
+        "compact",
+        "sleek",
+        "well-made"
+      ],
+      "kept_when_reviews_ON": true,
+      "kept_when_reviews_OFF": true
+    },
+    {
+      "id": "B07CV988JX",
+      "name": "TOODOO 8 Sets Mermaid Face Gems Glitter Sticker Rhinestone Bindis Crys",
+      "review_keywords": [
+        "beautiful",
+        "sticky",
+        "sparkly",
+        "durable",
+        "festive",
+        "adhesive"
+      ],
+      "kept_when_reviews_ON": true,
+      "kept_when_reviews_OFF": true
+    }
+  ]
+}

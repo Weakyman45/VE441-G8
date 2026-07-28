@@ -1,0 +1,86 @@
+\subsubsection{\textbf{Enrichment Ablation: Image-to-Image vs.\ Image-to-Text Retrieval}}
+\label{sec:exp-enrich-image}
+
+\paragraph{Sample Construction.}
+We evaluate, under an identical image input, which of two pipelines better exploits
+a user-supplied photo. Using a leave-one-out protocol, for each query product $P$ we
+treat $P$'s own image as the ``uploaded'' photo and define its relevant (gold) set as
+the other products sharing the same \emph{visual category}
+(\texttt{visual\_attrs.product\_category}):
+\[
+  \mathrm{Gold}(P)=\{\,j : \mathrm{cat}(j)=\mathrm{cat}(P)\ \wedge\ j\neq P\,\}.
+\]
+We sample $N{=}30$ query products (seed $42$) drawn from categories with at least four
+members, over a catalog of $1{,}516$ products of which $1{,}493$ carry a $1024$-dim
+DashScope \texttt{multimodal-embedding-v1} image vector.
+
+\paragraph{Conditions.}
+Both conditions receive the \emph{same} input image and return a top-$K$ ranking
+($K{=}30$, query product excluded):
+\textbf{A (image-to-image)} encodes the input image into a vector and ranks products
+by cosine similarity against their stored image embeddings
+(\texttt{image\_embedding} + \texttt{visual\_recall});
+\textbf{B (image-to-text)} first uses Qwen-VL to describe the image into English
+\texttt{search\_keywords}, then issues those keywords to the production text search
+over the product \texttt{name} (\texttt{describe\_shopping\_image} + \texttt{server.search}).
+
+\paragraph{Metrics.}
+Let $\mathrm{ranked}$ be the ranked list and $G=\mathrm{Gold}(P)$, with binary
+relevance $rel_i\in\{0,1\}$. We report three complementary top-$K$ measures:
+\[
+  \mathrm{precision@}K=\frac{\lvert G\cap \mathrm{ranked}_{1:K}\rvert}{K},\quad
+  \mathrm{recall@}K=\frac{\lvert G\cap \mathrm{ranked}_{1:K}\rvert}{\lvert G\rvert},\quad
+  \mathrm{nDCG@}K=\frac{\mathrm{DCG@}K}{\mathrm{IDCG@}K},
+\]
+where $\mathrm{DCG@}K=\sum_{i=1}^{K} rel_i/\log_2(i+1)$. Intuitively,
+\emph{precision@}$K$ measures the \emph{purity} of the shortlist (what fraction of the
+returned top-$K$ is actually relevant); \emph{recall@}$K$ measures \emph{coverage}
+(what fraction of all relevant products the shortlist manages to surface); and
+\emph{nDCG@}$K$ measures \emph{ranking quality}, rewarding relevant items placed near
+the top and discounting those found lower down, normalised to $[0,1]$ against the ideal
+ordering. Precision and recall trade off as $K$ grows---a longer list covers more but
+is less pure---so they are read together, while nDCG summarises whether the relevant
+items that are found are also well ordered. All metrics are averaged over the $N$
+queries.
+
+To test whether the A--B gap is systematic rather than driven by a few lucky queries,
+we use a per-query paired \emph{Wilcoxon signed-rank test} on the metric values. It is
+a non-parametric paired test (no normality assumption): it ranks the absolute per-query
+differences $\mathrm{metric}_{\mathrm{A}}-\mathrm{metric}_{\mathrm{B}}$ and checks
+whether positive differences dominate. A small $p$-value therefore indicates that A's
+advantage holds consistently across the query set; we mark ${}^{*}$, ${}^{**}$,
+${}^{***}$ at the $0.05$, $0.01$, $0.001$ thresholds. $\Delta=\mathrm{metric}_{\mathrm{A}}-\mathrm{metric}_{\mathrm{B}}$.
+
+\paragraph{Results.}
+Table~\ref{tab:exp-enrich-image} shows that image-to-image (A) dominates image-to-text
+(B) on all three metrics, and every difference is statistically significant under the
+paired Wilcoxon test ($p<0.01$). The pattern is consistent: A is not only more precise
+at the top of the list, but also recovers a substantially larger share of the relevant
+catalogue (its recall gain is the largest) and orders those hits better (higher nDCG).
+In other words, when a photo is available, matching directly in the visual embedding
+space surfaces more of the right products and ranks them higher than first verbalising
+the image into keywords. The gap stems from the double lossy conversion in image-to-text
+(\emph{vision $\rightarrow$ text $\rightarrow$ text matching}): the intermediate keywords
+are prone to cross-category drift---e.g.\ a bra photo described as ``lace / lingerie''
+retrieves wigs and hair extensions whose titles share those words---whereas
+image-to-image compares directly in the visual space and reliably stays within the
+correct category. This confirms the value of the offline \texttt{image\_embedding}
+enrichment as the primary retrieval path when a photo is provided.
+
+\begin{table}[t]
+\centering
+\caption{Image utilisation ablation ($N{=}30$, $K{=}30$; relevance = same visual
+category). A = image-to-image (visual embedding recall), B = image-to-text (Qwen-VL
+keywords + text search). $\Delta=\text{A}-\text{B}$; significance from a paired
+Wilcoxon signed-rank test ($^{*}p{<}0.05$, $^{**}p{<}0.01$, $^{***}p{<}0.001$).}
+\label{tab:exp-enrich-image}
+\begin{tabular}{lrrrrc}
+\toprule
+Metric & A (img$\to$img) & B (img$\to$txt) & $\Delta$ & $p$ & sig. \\
+\midrule
+precision@30 & 0.2356 & 0.1700 & $+0.0656$ & 0.0021 & ** \\
+nDCG@30      & 0.7559 & 0.6091 & $+0.1468$ & 0.0077 & ** \\
+recall@30    & 0.6867 & 0.4673 & $+0.2194$ & 0.0010 & ** \\
+\bottomrule
+\end{tabular}
+\end{table}

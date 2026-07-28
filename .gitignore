@@ -30,3 +30,7 @@ backend/data/catalog.db.*
 
 # Ad-hoc local diagnostic scripts
 backend/_test_online.py
+
+# JVM crash dumps from the Android build — do not commit
+hs_err_pid*.log
+replay_pid*.log

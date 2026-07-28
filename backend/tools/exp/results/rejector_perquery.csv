@@ -1,0 +1,41 @@
+﻿category,attribute,#pos,#pool,off_match,off_recall,off_size,rule_match,rule_recall,rule_size
+hair_extensions,hair,49,106,0.46226415094339623,1.0,106,0.8596491228070176,1.0,57
+dishwasher,stainless,7,14,0.5,1.0,14,1.0,1.0,7
+leggings,comfort,6,12,0.5,1.0,12,1.0,0.5,3
+makeup,makeup,10,20,0.5,1.0,20,1.0,1.0,10
+hair extensions,extensions,7,14,0.5,1.0,14,1.0,1.0,7
+water filter,water,16,32,0.5,1.0,32,1.0,1.0,16
+electronic component,plastic,6,12,0.5,1.0,12,1.0,1.0,6
+valve,industrial,13,26,0.5,1.0,26,1.0,1.0,13
+lipstick,lipstick,14,28,0.5,1.0,28,1.0,1.0,14
+hair care,plastic,13,28,0.4642857142857143,1.0,28,0.8666666666666667,1.0,15
+eyeshadow,eyeshadow,6,12,0.5,1.0,12,1.0,1.0,6
+knob,knob,11,22,0.5,1.0,22,1.0,1.0,11
+keychain,keychain,6,12,0.5,1.0,12,1.0,1.0,6
+pants,comfort,7,17,0.4117647058823529,1.0,17,1.0,0.7142857142857143,5
+skincare,plastic,31,69,0.4492753623188406,1.0,69,0.96875,1.0,32
+perfume,fragrance,13,29,0.4482758620689655,1.0,29,0.8666666666666667,1.0,15
+nail art decals,value,6,12,0.5,1.0,12,1.0,0.3333333333333333,2
+vent,works,6,14,0.42857142857142855,1.0,14,1.0,1.0,6
+hair extension,hair,9,18,0.5,1.0,18,0.9,1.0,10
+body care,plastic,6,12,0.5,1.0,12,1.0,1.0,6
+coffee filters,filters,8,16,0.5,1.0,16,1.0,1.0,8
+earrings,earrings,16,32,0.5,1.0,32,1.0,1.0,16
+hardware,industrial,16,34,0.47058823529411764,1.0,34,1.0,1.0,16
+nail polish,nail,14,28,0.5,1.0,28,1.0,1.0,14
+sweater,sweater,8,16,0.5,1.0,16,1.0,1.0,8
+skincare,skincare,38,76,0.5,1.0,76,0.9743589743589743,1.0,39
+hair_extensions,hairextensions,57,114,0.5,1.0,114,1.0,1.0,57
+hair accessory,clip,7,19,0.3684210526315789,1.0,19,0.875,1.0,8
+electronic component,electronic,6,12,0.5,1.0,12,0.8571428571428571,1.0,7
+nail polish,polish,14,28,0.5,1.0,28,1.0,1.0,14
+hair_extensions,extensions,44,101,0.43564356435643564,1.0,101,0.8461538461538461,1.0,52
+dishwasher,modern,7,14,0.5,1.0,14,1.0,1.0,7
+valve,valve,13,26,0.5,1.0,26,1.0,1.0,13
+hair extensions,natural,6,13,0.46153846153846156,1.0,13,1.0,1.0,6
+headband,circular,16,33,0.48484848484848486,1.0,33,0.9411764705882353,1.0,17
+leggings,leggings,6,12,0.5,1.0,12,1.0,1.0,6
+seal,flexible,7,14,0.5,1.0,14,1.0,1.0,7
+cardigan,cardigan,6,12,0.5,1.0,12,1.0,1.0,6
+accessory,accessory,11,22,0.5,1.0,22,1.0,1.0,11
+egg storage,rectangular,7,14,0.5,1.0,14,1.0,1.0,7

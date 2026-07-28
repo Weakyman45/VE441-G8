@@ -41,6 +41,7 @@ from ws_proxy import UpstreamSender, connect_openai_realtime, relay_sockets, ws_
 
 from engine.bus import EventBus
 from engine.events import Event, EventType
+from engine.exp_config import load_config
 from engine.intent import extract_preference
 from engine.logging_store import LoggingStore
 from engine.llm.analyze import analyze_need, analyze_need_stream
@@ -276,8 +277,10 @@ def search(params: dict) -> list[dict]:
     if tokens:
         # 创新点二:文本召回除 name 外也命中富集文本 enriched_text(若已富集),
         # 以扩大召回覆盖细粒度属性;相关性排序仍以 name 命中为主,保持精度不变。
+        # 消融开关 VS_ENRICHMENT=0 时,即使库里已有 enriched_text 也不使用(仅匹配
+        # name),从而在同一个库上模拟"无富集"系统,便于做 A/B 消融实验。
         match_cols = ["name"]
-        if _enriched_available():
+        if _enriched_available() and load_config().enrichment:
             match_cols.append("enriched_text")
         per_tok = []
         for _t in tokens:

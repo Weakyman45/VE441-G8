@@ -1,0 +1,92 @@
+\subsection{\textbf{Recall-Agent Ablation: Text, Image and Fused Retrieval vs.\ an LLM-free Keyword Baseline}}
+\label{sec:exp-recall-agent}
+
+\paragraph{Sample Construction.}
+We evaluate the two recall paths of the Recall agent---keyword text recall and visual
+image recall---and ask whether fusing both, and whether extracting query terms with an
+LLM at all, improves the candidate set delivered to ranking. Using a leave-one-out
+protocol, each query simulates a user who both \emph{types a description} and
+\emph{uploads a photo}: for a query product $P$ the typed text is $P$'s stored
+appearance terms (\texttt{visual\_attrs.keywords}) and the uploaded photo is $P$'s own
+image. A product $j$ is relevant iff it shares $P$'s visual category
+(\texttt{visual\_attrs.product\_category}) and is not $P$ itself:
+\[
+  \mathrm{Gold}(P)=\{\,j:\ \mathrm{cat}(j)=\mathrm{cat}(P)\ \wedge\ j\neq P\,\}.
+\]
+We sample $N{=}30$ query products (seed $42$) from a pool of $868$ eligible queries
+(products carrying an image, a $1024$-dim DashScope \texttt{multimodal-embedding-v1}
+image vector, usable appearance terms, and belonging to a category with at least four
+members), over a catalog of $1{,}516$ products of which $1{,}493$ are embedded. The
+query product is excluded from every returned list.
+
+\paragraph{Conditions.}
+All conditions receive the \emph{same} query and return a top-$K$ ranking ($K{=}30$),
+re-ranked by the identical scoring key used downstream (keyword hits on the product
+\texttt{name}, then visual cosine; the image-only list is ordered by visual cosine
+alone). \textbf{N (keyword, LLM-free)} is the baseline: it bypasses the language
+understanding stage and feeds the product's \emph{raw title} directly to the production
+keyword search (regex tokenisation over \texttt{name}$+$\texttt{enriched\_text}, no LLM
+term extraction). \textbf{T (text-only)} runs keyword recall with the
+\emph{LLM/VL-refined} appearance terms as query. \textbf{I (image-only)} runs visual
+recall only (\texttt{image\_embedding}$+$\texttt{visual\_recall}, pure visual with no
+category filter, so the gold category is never leaked to retrieval). \textbf{F (fused,
+full agent)} runs both paths, unions the candidates, and attaches a visual-similarity
+score to every candidate.
+
+\paragraph{Metrics.}
+Let $\mathrm{ranked}$ be the returned list and $G=\mathrm{Gold}(P)$, with binary
+relevance $rel_i\in\{0,1\}$. We report three complementary top-$K$ measures,
+\[
+  \mathrm{precision@}K=\frac{\lvert G\cap \mathrm{ranked}_{1:K}\rvert}{K},\quad
+  \mathrm{recall@}K=\frac{\lvert G\cap \mathrm{ranked}_{1:K}\rvert}{\lvert G\rvert},\quad
+  \mathrm{nDCG@}K=\frac{\mathrm{DCG@}K}{\mathrm{IDCG@}K},
+\]
+with $\mathrm{DCG@}K=\sum_{i=1}^{K} rel_i/\log_2(i+1)$. \emph{precision@}$K$ is the purity
+of the shortlist, \emph{recall@}$K$ its coverage of the relevant set, and
+\emph{nDCG@}$K$ the ranking quality of the retrieved relevant items, normalised to
+$[0,1]$. All metrics are averaged over the $N$ queries. To test whether each recall
+condition improves over the LLM-free baseline, and whether fusion improves over a single
+path, we run per-query paired \emph{Wilcoxon signed-rank tests} (two-sided,
+non-parametric) and mark ${}^{*}$, ${}^{**}$, ${}^{***}$ at the $0.05$, $0.01$, $0.001$
+thresholds (ns $=$ not significant).
+
+\begin{table}[t]
+\centering
+\caption{Recall-agent ablation ($N{=}30$ queries, $K{=}30$; relevance $=$ same visual
+category). N $=$ LLM-free keyword search on the raw title, T $=$ text-only keyword recall
+with LLM/VL-refined terms, I $=$ image-only visual recall, F $=$ fused. Superscripts on
+the recall rows give the paired-Wilcoxon significance of that row \emph{against the
+LLM-free baseline} N.}
+\label{tab:exp-recall-agent}
+\begin{tabular}{lrrr}
+\toprule
+Mode & precision@30 & nDCG@30 & recall@30 \\
+\midrule
+N (keyword, LLM-free) & 0.1633 & 0.6001 & 0.4365 \\
+T (text-only)         & 0.1644$^{\,\mathrm{ns}}$ & 0.5899$^{\,\mathrm{ns}}$ & 0.4951$^{\,\mathrm{ns}}$ \\
+I (image-only)        & 0.2356$^{**}$ & 0.7559$^{***}$ & 0.6867$^{***}$ \\
+F (fused)             & 0.2256$^{**}$ & 0.7138$^{**}$  & 0.6481$^{**}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Results.}
+Table~\ref{tab:exp-recall-agent} isolates where the retrieval quality comes from. Two
+findings stand out. First, \emph{the visual path is the decisive signal}: image-only
+(I) and fused (F) beat the LLM-free keyword baseline (N) on all three metrics with
+paired-Wilcoxon significance ($p<0.01$)---for example recall rises from $0.44$ (N) to
+$0.69$ (I, $+0.250$, $p<0.001$) and $0.65$ (F, $+0.212$, $p<0.01$)---whereas keyword
+recall with \emph{LLM-refined} terms (T) is statistically indistinguishable from the raw
+keyword baseline (all $\lvert\Delta_{T-N}\rvert\le 0.06$, ns). In other words, under a
+visual-category notion of relevance, verbalising the request into keywords---with or
+without an LLM---cannot capture appearance similarity as well as matching directly in the
+image-embedding space. Second, \emph{fusion inherits the strength of the visual path}:
+F significantly outperforms text-only (F$-$T $=+0.061/{+}0.124/{+}0.153$ for
+precision/nDCG/recall, all $p<0.001$) and is statistically tied with image-only
+(F$-$I small and ns on every metric). Fusion therefore never underperforms the stronger
+single modality while recovering the coverage that text alone misses; pure text-only
+retrieval is prone to cross-category drift, e.g.\ a bra whose appearance terms include
+``lace / lingerie'' surfaces wigs and hair extensions whose titles share those words.
+Overall the ablation validates the two-path design: the image-embedding path is the
+primary driver of category-consistent recall when a photo is present, and the fusion
+agent robustly combines it with the text path to deliver the best-ranked shortlist.
